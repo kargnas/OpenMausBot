@@ -22,8 +22,8 @@
   "packageManager": "pnpm@10.33.0",
   "scripts": {
     "dev": "vite",
-    "dev:server": "node --experimental-strip-types server/index.ts",
-    "dev:desktop": "electron .",
+    "dev:server": "node --watch --experimental-strip-types server/index.ts",
+    "dev:desktop": "node scripts/dev-desktop.mjs",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
     "test": "vitest run && pnpm test:updater",
