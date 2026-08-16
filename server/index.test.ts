@@ -291,6 +291,24 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("rejects malformed or unavailable model selections before persisting them", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+
+    const malformed = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-model", effort: 7 },
+    });
+    expect(malformed).toMatchObject({ status: 400, body: { error: "invalid model selection" } });
+
+    const unavailable = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-model" },
+    });
+    expect(unavailable.status).toBe(409);
+    expect(unavailable.body.error).toContain("ghost");
+
+    await api("DELETE", `/api/bots/${bot.id}`);
+  });
+
   it("persists an answered onboarding card", async () => {
     const { body } = await api("GET", "/api/bots");
     const bot = body.bots[0];

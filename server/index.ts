@@ -23,7 +23,7 @@ import {
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import { resetPathCache } from "./env-path.ts";
 import { buildNotification, type Notification } from "./notify.ts";
-import type { RuntimeEvent } from "./contracts.ts";
+import type { ModelSelection, RuntimeEvent } from "./contracts.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
@@ -31,6 +31,7 @@ import { discardDelegations, drainDelegations, queueDelegation, type QueueResult
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
+import { modelSupportsTools, selectedModel } from "./models.ts";
 import { mentionedBots, roomResponders, Store, type GroupDefaultResponder, type Message } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
@@ -128,16 +129,16 @@ function askBotAndWait(targetBotId: string, message: string, depth: number): Pro
 // default selection for new bots: first available instance, claude preferred
 async function defaultSelection() {
   const described = await registry.describe();
-  const available = described.filter((d) => d.snapshot.state === "available");
+  const available = described.filter((d) => d.snapshot.state === "available" && d.models.options.length > 0);
   // Deliberately NO fallback to described[0]. Handing a bot an engine whose
   // CLI isn't installed makes it look ready and then fail on send with a raw
   // spawn ENOENT — the single worst first-run experience, and the one every
   // user with no CLIs used to get. An empty selection is honest: the UI shows
   // the setup path instead of a bot that cannot answer.
   const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0];
-  return { instanceId: pick?.instanceId ?? "", model: pick?.models.default ?? "" };
+  return { instanceId: pick?.instanceId ?? "", ...(pick?.models.default ?? { model: "" }) };
 }
-let bootSelection = { instanceId: "", model: "" };
+let bootSelection: ModelSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
@@ -604,9 +605,16 @@ async function startTurn(
   // a task takes its name from the first thing you asked it to do
   if (text.trim()) store.titleTaskFromFirstMessage(bot.id, text, threadId);
 
+  const sourceInstance = registry.get(bot.modelSelection.instanceId);
+  if (!sourceInstance) {
+    throw Object.assign(
+      new Error(`provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`),
+      { status: 409 },
+    );
+  }
   const instance = opts?.runOn === "cloud"
     ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-    : registry.get(bot.modelSelection.instanceId);
+    : sourceInstance;
   if (!instance) {
     throw Object.assign(
       new Error(
@@ -617,8 +625,17 @@ async function startTurn(
       { status: 409 },
     );
   }
+  let modelOption;
+  try {
+    modelOption = selectedModel(bot.modelSelection, await sourceInstance.catalog());
+  } catch (error) {
+    throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { status: 409 });
+  }
+  if (opts?.runOn === "cloud" && !modelOption.provider) {
+    throw Object.assign(new Error(`model "${bot.modelSelection.model}" cannot run on the cloud computer`), { status: 409 });
+  }
   const instanceId = instance.instanceId;
-  const model = opts?.runOn === "cloud" ? instance.models.default : bot.modelSelection.model;
+  const model = bot.modelSelection.model;
 
   // an edit hands us its already-branched user message; a plain send appends
   let userMessage = opts?.userMessage;
@@ -683,8 +700,9 @@ async function startTurn(
       const dwebUrl = process.env.DWEB_URL?.trim();
       if (dwebUrl) integrations.dweb = { url: dwebUrl };
       const wants = opts?.runOn === "cloud" ? "cloud" : bot.computer; // cloud routine overrides the MAUS default
-      const mountsComputerMcp = instance.adapter.capabilities.computerMcp === true;
-      const mountsCloudComputer = mountsComputerMcp || instance.driverKind === "boxAgent";
+      const supportsTools = modelSupportsTools(modelOption);
+      const mountsComputerMcp = instance.adapter.capabilities.computerMcp === true && supportsTools;
+      const mountsCloudComputer = (mountsComputerMcp || instance.driverKind === "boxAgent") && supportsTools;
       let previewBoxId: string | null = null;
       let computerKind: "box" | "vm" | "local" | null = null;
 
@@ -770,6 +788,7 @@ async function startTurn(
       if (
         commsDepth < MAX_COMMS_DEPTH &&
         instance.adapter.capabilities.agentsMcp === true &&
+        supportsTools &&
         store.bots.filter((b) => b.id !== bot.id && !b.hidden).length > 0
       ) {
         integrations.agents = agentsIntegration(bot.id, threadId, commsDepth);
@@ -793,6 +812,9 @@ async function startTurn(
         threadId,
         text: turnText,
         model,
+        effort: bot.modelSelection.effort,
+        serviceTier: bot.modelSelection.serviceTier,
+        modelProvider: modelOption.provider,
         // a rewound thread never resumes the abandoned branch's session
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
@@ -968,6 +990,19 @@ async function runGroupMemberTurn(
     broadcast({ kind: "message", threadId: group.threadId, message: failure });
     return;
   }
+  let modelOption;
+  try {
+    modelOption = selectedModel(bot.modelSelection, await instance.catalog());
+  } catch (error) {
+    const failure = store.appendMessage(group.threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${error instanceof Error ? error.message.slice(0, 140) : "model unavailable"}`, ok: false },
+    });
+    broadcast({ kind: "message", threadId: group.threadId, message: failure });
+    return;
+  }
 
   store.patchGroup(group.id, { busyBotId: bot.id });
   broadcastGroup(group.id);
@@ -1010,7 +1045,15 @@ async function runGroupMemberTurn(
     });
     const timer = setTimeout(finish, 5 * 60_000);
     instance.adapter
-      .sendTurn({ threadId: group.threadId, text, system })
+      .sendTurn({
+        threadId: group.threadId,
+        text,
+        system,
+        model: bot.modelSelection.model,
+        effort: bot.modelSelection.effort,
+        serviceTier: bot.modelSelection.serviceTier,
+        modelProvider: modelOption.provider,
+      })
       .catch((err) => {
         const failure = store.appendMessage(group.threadId, {
           role: "bot",
@@ -1708,8 +1751,35 @@ const server = createServer(async (req, res) => {
     if (m && method === "PATCH") {
       const body = await readBody(req);
       const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"] as const) {
+      for (const key of ["name", "title", "description", "notifications", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
+      }
+      if (body.modelSelection !== undefined) {
+        const raw = body.modelSelection as Record<string, unknown>;
+        if (
+          !raw ||
+          typeof raw !== "object" ||
+          typeof raw.instanceId !== "string" ||
+          typeof raw.model !== "string" ||
+          (raw.effort !== undefined && typeof raw.effort !== "string") ||
+          (raw.serviceTier !== undefined && raw.serviceTier !== null && typeof raw.serviceTier !== "string")
+        ) {
+          return json(res, 400, { error: "invalid model selection" });
+        }
+        const selectedInstance = registry.get(raw.instanceId);
+        if (!selectedInstance) return json(res, 409, { error: `provider instance "${raw.instanceId}" is unavailable` });
+        const selection: ModelSelection = {
+          instanceId: raw.instanceId,
+          model: raw.model,
+          ...(typeof raw.effort === "string" ? { effort: raw.effort } : {}),
+          ...(raw.serviceTier !== undefined ? { serviceTier: raw.serviceTier as string | null } : {}),
+        };
+        try {
+          selectedModel(selection, await selectedInstance.catalog());
+        } catch (error) {
+          return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+        patch.modelSelection = selection;
       }
       if (
         body.computer !== undefined &&
