@@ -77,7 +77,7 @@ process.stdin.on("data", (chunk) => {
       case "thread/start":
         out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
         break;
-      case "model/list":
+      case "model/list": {
         const secondPage = msg.params?.cursor === "page-2";
         out({
           jsonrpc: "2.0",
@@ -124,6 +124,7 @@ process.stdin.on("data", (chunk) => {
           },
         });
         break;
+      }
       case "config/read":
         out({
           jsonrpc: "2.0",
