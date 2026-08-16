@@ -72,6 +72,7 @@ const dump = () => {
 };
 dump();
 if (argv.join(" ") === "exec --help") {
+  if (process.env.FAKE_ACP_HELP_DUMP) writeFileSync(process.env.FAKE_ACP_HELP_DUMP, "called");
   console.log(`Available Models:
   auto                         Auto Model
   claude-opus-5                Opus 5 (default)

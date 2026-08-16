@@ -6,11 +6,11 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly —
 // resolveCliSpawn turns it into `node <script>`, so these run everywhere.
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ensureDirs } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
@@ -157,12 +157,14 @@ describe("ACP turns (fake CLI)", () => {
   afterEach(async () => {
     delete process.env.FAKE_ACP_MODE;
     delete process.env.FAKE_ACP_DUMP;
+    delete process.env.FAKE_ACP_RPC_DUMP;
     delete process.env.XAI_API_KEY;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.FAKE_ACP_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_USAGE_ROOT;
     delete process.env.KIMI_CODE_HOME;
+    vi.useRealTimers();
     recorder?.stop();
     await instance?.dispose();
     rmSync(scratch, { recursive: true, force: true });
@@ -209,6 +211,38 @@ describe("ACP turns (fake CLI)", () => {
         { id: "fake-acp-fast", label: "Fake ACP Fast" },
       ],
     });
+  });
+
+  it("times out provider selection requests before prompting", async () => {
+    let selectionReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      selectionReady = resolve;
+    });
+    const driver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "hangingSelectionTest",
+      selectModel: undefined,
+      configureSession: async () => {
+        // Start fake time after the child handshake so only the missing
+        // selection timeout is under test.
+        vi.useFakeTimers({ toFake: ["setTimeout"] });
+        selectionReady();
+      },
+      applySelection: async (request, sessionId) => {
+        await request("session/never", { sessionId });
+      },
+    });
+    await create(driver);
+
+    await instance.adapter.sendTurn({ threadId: "t-selection-timeout", text: "go" });
+    await ready;
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(recorder.events.find((event) => event.type === "turn.completed")).toMatchObject({
+      ok: false,
+      stopReason: "rpc_error",
+    });
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toContain("session/never timed out");
   });
 
   it("discovers Kimi models and configured defaults from provider JSON", async () => {
@@ -305,10 +339,16 @@ describe("ACP turns (fake CLI)", () => {
   });
 
   it("droid pins read-only mode when fullAuto is off", async () => {
+    mkdirSync(join(scratch, ".factory"), { recursive: true });
+    writeFileSync(
+      join(scratch, ".factory", "settings.json"),
+      JSON.stringify({ sessionDefaultSettings: { model: "claude-opus-5" } }),
+    );
+    const helpDump = join(scratch, "droid-help-called");
     instance = await DroidAgentDriver.create({
       instanceId: "droid-safe",
       displayName: "Droid Safe",
-      environment: {},
+      environment: { HOME: scratch, FAKE_ACP_HELP_DUMP: helpDump },
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false },
     });
@@ -326,6 +366,7 @@ describe("ACP turns (fake CLI)", () => {
       { method: "session/set_mode", params: { sessionId: "fake-acp-session", modeId: "normal" } },
       { method: "session/set_model", params: { sessionId: "fake-acp-session", modelId: "claude-opus-5" } },
     ]);
+    expect(existsSync(helpDump)).toBe(false);
   });
 
   it("droid names the rejected setting when the agent predates session config", async () => {

@@ -200,7 +200,15 @@ const support: AcpSupport = {
     // Pin the model for the same reason as the mode: with no set_model the
     // session runs whatever ~/.factory/settings.json selected, which can be a
     // `custom:` provider pointing at its own endpoint and key.
-    const modelId = turn.model || (await readDroidCatalog(config.cli, env)).default.model;
+    let modelId = turn.model;
+    if (!modelId) {
+      try {
+        modelId = readSettings(env).sessionDefaultSettings?.model;
+      } catch {
+        // Unreadable local settings fall through to the CLI-reported default.
+      }
+    }
+    modelId ||= (await readDroidCatalog(config.cli, env)).default.model;
     await applySetting(request, "session/set_model", { sessionId, modelId }, `model "${modelId}"`);
     if (turn.effort) {
       await applySetting(

@@ -111,7 +111,7 @@ export interface AcpSupport {
 }
 
 const INIT_TIMEOUT = 20_000;
-const SESSION_CONFIG_TIMEOUT = 20_000; // configureSession's per-request default
+const SESSION_CONFIG_TIMEOUT = 20_000; // per-request default for session configuration
 const NEW_SESSION_TIMEOUT = 30_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
 const PROVIDER_CREDENTIAL_ENV = [
@@ -196,6 +196,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           env,
           stdio: ["pipe", "pipe", "pipe"],
         });
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
         try {
           const initialized = await new Promise<any>((resolve, reject) => {
             let buffer = "";
@@ -632,17 +634,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 }
               }
 
+              const configRequest = (method: string, params: unknown, timeoutMs?: number) =>
+                request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT);
               if (support.configureSession) {
                 await support.configureSession({
-                  request: (method, params, timeoutMs) =>
-                    request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT),
+                  request: configRequest,
                   sessionId,
                   config,
                   env,
                   turn,
                 });
               }
-              await support.applySelection?.(request, sessionId, turn);
+              await support.applySelection?.(configRequest, sessionId, turn);
             } catch (error) {
               // session.started is the only place the resume cursor is recorded,
               // so a rejected setting must not orphan a session we just created.
