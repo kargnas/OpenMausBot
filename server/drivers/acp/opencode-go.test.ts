@@ -28,7 +28,7 @@ describe("OpenCode Go catalog", () => {
     );
 
     expect(models).toEqual({
-      default: "opencode-go/minimax-m3",
+      default: { model: "opencode-go/minimax-m3" },
       options: [{ id: "opencode-go/minimax-m3", label: "Minimax M3" }],
     });
   });
@@ -42,10 +42,10 @@ describe("OpenCode Go catalog", () => {
       throw new Error("network down");
     });
 
-    expect(fallback.default).toBe("opencode-go/kimi-k3");
+    expect(fallback.default.model).toBe("opencode-go/kimi-k3");
   });
 
-  it("refreshes the same instance catalog on each explicit refresh", async () => {
+  it("resolves a fresh instance catalog on each request", async () => {
     let calls = 0;
     const driver = createOpenCodeGoDriver(async () => {
       calls += 1;
@@ -60,11 +60,9 @@ describe("OpenCode Go catalog", () => {
       config: driver.defaultConfig(),
     });
 
-    expect(instance.models.default).toBe("opencode-go/minimax-m3");
-    await instance.refreshModels?.();
-    expect(instance.models.default).toBe("opencode-go/kimi-k3");
-    await instance.refreshModels?.();
-    expect(instance.models.default).toBe("opencode-go/glm-5.2");
+    expect((await instance.catalog()).default.model).toBe("opencode-go/minimax-m3");
+    expect((await instance.catalog()).default.model).toBe("opencode-go/kimi-k3");
+    expect((await instance.catalog()).default.model).toBe("opencode-go/glm-5.2");
     await instance.dispose();
   });
 

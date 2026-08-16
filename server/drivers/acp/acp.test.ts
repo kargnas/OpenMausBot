@@ -29,7 +29,6 @@ const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "test
 const SELECT_MODEL_SUPPORT: AcpSupport = {
   driverKind: "selectModelTest",
   displayName: "Select Model Test",
-  models: { default: "m-one", options: [{ id: "m-one", label: "One" }, { id: "m-two", label: "Two" }] },
   defaultCli: "fake-select-model",
   nativeSource: "test.acp",
   loginNote: "never reached",
@@ -76,7 +75,6 @@ describe("ACP decodeConfig", () => {
     const support: AcpSupport = {
       driverKind: "dynamic-test",
       displayName: "Dynamic Test",
-      models: { default: "fallback", options: [{ id: "fallback", label: "Fallback" }] },
       defaultCli: FAKE_CLI,
       nativeSource: "dynamic-test.acp",
       loginNote: "not authenticated",
@@ -85,7 +83,7 @@ describe("ACP decodeConfig", () => {
       authFailure: "continue",
       isAuthenticated: () => true,
       resolveModels: async () => ({
-        default: "dynamic-model",
+        default: { model: "dynamic-model" },
         options: [{ id: "dynamic-model", label: "Dynamic model" }],
       }),
     };
@@ -97,8 +95,8 @@ describe("ACP decodeConfig", () => {
       enabled: true,
       config: driver.defaultConfig(),
     });
-    expect(instance.models).toEqual({
-      default: "dynamic-model",
+    await expect(instance.catalog()).resolves.toEqual({
+      default: { model: "dynamic-model" },
       options: [{ id: "dynamic-model", label: "Dynamic model" }],
     });
     await instance.dispose();
@@ -164,6 +162,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.KIMI_CODE_HOME;
     recorder?.stop();
     await instance?.dispose();
     rmSync(scratch, { recursive: true, force: true });
@@ -193,6 +192,43 @@ describe("ACP turns (fake CLI)", () => {
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({ type: "turn.completed", ok: true });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("discovers the current model and effort capabilities from ACP initialize", async () => {
+    await create();
+
+    await expect(instance.catalog()).resolves.toEqual({
+      default: { model: "fake-acp-model", effort: "high" },
+      options: [
+        {
+          id: "fake-acp-model",
+          label: "Fake ACP Model",
+          efforts: ["low", "high"],
+          defaultEffort: "high",
+        },
+        { id: "fake-acp-fast", label: "Fake ACP Fast" },
+      ],
+    });
+  });
+
+  it("discovers Kimi models and configured defaults from provider JSON", async () => {
+    process.env.KIMI_CODE_HOME = scratch;
+    writeFileSync(join(scratch, "config.toml"), 'default_model = "fake-kimi-1"\n\n[thinking]\neffort = "high"\n');
+    await create(KimiAgentDriver);
+
+    await expect(instance.catalog()).resolves.toEqual({
+      default: { model: "fake-kimi-1", effort: "high" },
+      options: [
+        {
+          id: "fake-kimi-1",
+          label: "Fake Kimi One",
+          efforts: ["low", "high"],
+          defaultEffort: "low",
+          toolUse: true,
+        },
+        { id: "fake-kimi-2", label: "Fake Kimi Two", toolUse: false },
+      ],
+    });
   });
 
   it("reads token usage from the root of the prompt result", async () => {
@@ -308,6 +344,57 @@ describe("ACP turns (fake CLI)", () => {
     // The session id still reached the client, so the thread can resume rather
     // than orphaning the session droid just created.
     expect(recorder.events.some((e) => e.type === "session.started")).toBe(true);
+  });
+
+  it("passes the selected Grok model and effort as CLI arguments", async () => {
+    await create();
+    const dump = join(scratch, "grok-selection.json");
+    process.env.FAKE_ACP_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-grok-selection",
+      text: "go",
+      model: "fake-acp-model",
+      effort: "high",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const { argv } = JSON.parse(readFileSync(dump, "utf8"));
+    expect(argv).toEqual([
+      "--permission-mode",
+      "default",
+      "-m",
+      "fake-acp-model",
+      "--reasoning-effort",
+      "high",
+      "agent",
+      "stdio",
+    ]);
+  });
+
+  it("applies the selected Kimi model and effort through ACP session options", async () => {
+    await create(KimiAgentDriver);
+    const dump = join(scratch, "kimi-selection.json");
+    process.env.FAKE_ACP_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-kimi-selection",
+      text: "go",
+      model: "fake-kimi-1",
+      effort: "high",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const { calls } = JSON.parse(readFileSync(dump, "utf8"));
+    expect(calls.find((call: any) => call.method === "session/set_model")?.params).toEqual({
+      sessionId: "fake-acp-session",
+      modelId: "fake-kimi-1",
+    });
+    expect(calls.find((call: any) => call.method === "session/set_config_option")?.params).toEqual({
+      sessionId: "fake-acp-session",
+      configId: "thinking",
+      value: "high",
+    });
   });
 
   it("surfaces a permission ask as request.opened and completes once allowed", async () => {
@@ -583,12 +670,13 @@ describe("ACP snapshot", () => {
     });
     try {
       // favourites first in the user's own order, then the built-in slice
-      expect(instance.models.options.slice(0, 2)).toEqual([
+      const catalog = await instance.catalog();
+      expect(catalog.options.slice(0, 2)).toEqual([
         { id: "custom:Azure-Opus-0", label: "Azure Opus" },
         { id: "custom:LMStudio-Qwen-0", label: "Qwen (local)" },
       ]);
-      expect(instance.models.options.some((o) => o.id === "claude-opus-5")).toBe(true);
-      expect(instance.models.default).toBe("custom:LMStudio-Qwen-0");
+      expect(catalog.options.some((o) => o.id === "claude-opus-5")).toBe(true);
+      expect(catalog.default.model).toBe("custom:LMStudio-Qwen-0");
     } finally {
       await instance.dispose();
       rmSync(scratch, { recursive: true, force: true });
@@ -608,8 +696,9 @@ describe("ACP snapshot", () => {
       config: { cli: FAKE_CLI, fullAuto: false },
     });
     try {
-      expect(instance.models.default).toBe("claude-opus-5");
-      expect(instance.models.options.every((o) => !o.id.startsWith("custom:"))).toBe(true);
+      const catalog = await instance.catalog();
+      expect(catalog.default.model).toBe("claude-opus-5");
+      expect(catalog.options.every((o) => !o.id.startsWith("custom:"))).toBe(true);
     } finally {
       await instance.dispose();
       rmSync(scratch, { recursive: true, force: true });

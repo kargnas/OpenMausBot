@@ -75,8 +75,11 @@ function resolveModels(env: Record<string, string | undefined>) {
   const options = merged.sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
 
   const configured = settings.sessionDefaultSettings?.model;
-  const fallback = options[0]?.id ?? MODELS.default;
-  return { default: configured && options.some((o) => o.id === configured) ? configured : fallback, options };
+  const fallback = options[0]?.id ?? MODELS.default.model;
+  return {
+    default: { model: configured && options.some((o) => o.id === configured) ? configured : fallback },
+    options,
+  };
 }
 
 // droid answers a rejected setting with a bare JSON-RPC message ("Model not
@@ -110,7 +113,7 @@ const MODE_FULL_AUTO = "auto-high";
 // `custom:` prefix, so they can't be enumerated statically; a bot can still be
 // switched onto one through the model picker (PATCH /api/bots/:id).
 const MODELS = {
-  default: "claude-opus-5",
+  default: { model: "claude-opus-5" },
   options: [
     { id: "auto", label: "Auto (Factory picks)" },
     { id: "claude-opus-5", label: "Claude Opus 5" },
@@ -128,7 +131,6 @@ const MODELS = {
 const support: AcpSupport = {
   driverKind: "droidAgent",
   displayName: "Droid",
-  models: MODELS,
   defaultCli: "droid",
   nativeSource: "droid.acp",
   loginNote: "Droid CLI is not signed in — run `droid` once and log in, or set FACTORY_API_KEY",
@@ -165,7 +167,7 @@ const support: AcpSupport = {
     // Pin the model for the same reason as the mode: with no set_model the
     // session runs whatever ~/.factory/settings.json selected, which can be a
     // `custom:` provider pointing at its own endpoint and key.
-    const modelId = turn.model || MODELS.default;
+    const modelId = turn.model || MODELS.default.model;
     await applySetting(request, "session/set_model", { sessionId, modelId }, `model "${modelId}"`);
   },
 
