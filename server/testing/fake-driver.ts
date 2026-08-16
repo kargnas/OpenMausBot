@@ -16,6 +16,8 @@ export interface FakeDriverOptions {
   failCreate?: string;
   /** snapshot() rejects with this message (describe-downgrade path). */
   failSnapshot?: string;
+  /** catalog() rejects with this message (describe catalog-error path). */
+  failCatalog?: string;
 }
 
 export interface FakeDriverHandle {
@@ -35,7 +37,6 @@ export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
     driver: {
       driverKind: kind,
       metadata: { displayName: `Fake ${kind}` },
-      models: { default: `${kind}-1`, options: [{ id: `${kind}-1`, label: `${kind} one` }] },
       decodeConfig(raw: unknown) {
         if (raw && typeof raw === "object" && (raw as Record<string, unknown>).bad) {
           throw new Error(`${kind}: bad config`);
@@ -55,7 +56,13 @@ export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
           driverKind: kind,
           displayName: input.displayName,
           enabled: input.enabled,
-          models: handle.driver.models,
+          catalog: async () => {
+            if (opts.failCatalog) throw new Error(opts.failCatalog);
+            return {
+              default: { model: `${kind}-1` },
+              options: [{ id: `${kind}-1`, label: `${kind} one` }],
+            };
+          },
           snapshot: async (): Promise<ProviderSnapshot> => {
             if (opts.failSnapshot) throw new Error(opts.failSnapshot);
             return { state: "available", version: "0.0.0-fake" };

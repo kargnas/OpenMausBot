@@ -95,7 +95,7 @@ export class ProviderRegistry {
             driverKind: entry.shadow.driverKind,
             displayName: entry.shadow.displayName ?? entry.shadow.driverKind,
             snapshot: { state: "unavailable", reason: entry.shadow.reason } satisfies ProviderSnapshot,
-            models: { default: "", options: [] },
+            models: { default: { model: "" }, options: [] },
             capabilities: { computerMcp: false, agentsMcp: false },
             // an unknown driver has no driver record, hence no install path
             install: this.driversByKind.get(entry.shadow.driverKind)?.install,
@@ -109,12 +109,22 @@ export class ProviderRegistry {
         } catch (e) {
           snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };
         }
+        let models;
+        try {
+          models = await inst.catalog();
+        } catch (e) {
+          models = {
+            default: { model: "" },
+            options: [],
+            error: e instanceof Error ? e.message : String(e),
+          };
+        }
         return {
           instanceId: inst.instanceId,
           driverKind: inst.driverKind,
           displayName: inst.displayName ?? inst.driverKind,
           snapshot,
-          models: inst.models,
+          models,
           capabilities: {
             computerMcp: inst.adapter.capabilities.computerMcp === true,
             agentsMcp: inst.adapter.capabilities.agentsMcp === true,
