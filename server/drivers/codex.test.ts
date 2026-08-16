@@ -114,7 +114,6 @@ describe("CodexDriver turns (fake app-server)", () => {
           efforts: ["low", "high"],
           defaultEffort: "low",
           serviceTiers: [
-            { id: "priority", label: "Fast" },
             { id: "fast", label: "Fast" },
           ],
           defaultServiceTier: null,

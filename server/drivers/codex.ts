@@ -120,13 +120,21 @@ async function readCatalog(cli: string, environment: Record<string, string>): Pr
     const options: ModelCatalog["options"] = (Array.isArray(listed?.data) ? listed.data : [])
       .filter((model: any) => typeof model?.id === "string" && model.hidden !== true)
       .map((model: any) => {
+        const additionalSpeedTiers = Array.isArray(model.additionalSpeedTiers)
+          ? model.additionalSpeedTiers.filter((id: unknown): id is string => typeof id === "string")
+          : [];
         const serviceTiers: Array<{ id: string; label: string }> = Array.isArray(model.serviceTiers)
           ? model.serviceTiers
               .filter((tier: any) => typeof tier?.id === "string")
               .map((tier: any) => ({ id: tier.id, label: typeof tier.name === "string" ? tier.name : tier.id }))
           : [];
-        for (const id of Array.isArray(model.additionalSpeedTiers) ? model.additionalSpeedTiers : []) {
-          if (typeof id === "string" && !serviceTiers.some((tier) => tier.id === id)) {
+        for (const id of additionalSpeedTiers) {
+          if (id === "fast") {
+            // Codex reports the same speed mode under both IDs; keep the ID used by current config values.
+            const priorityIndex = serviceTiers.findIndex((tier) => tier.id === "priority" && tier.label === "Fast");
+            if (priorityIndex !== -1) serviceTiers.splice(priorityIndex, 1);
+          }
+          if (!serviceTiers.some((tier) => tier.id === id)) {
             serviceTiers.push({ id, label: id.charAt(0).toUpperCase() + id.slice(1) });
           }
         }
