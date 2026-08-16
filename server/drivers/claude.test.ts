@@ -128,7 +128,6 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       id: "",
       label: "CLI default",
       efforts: ["low", "medium", "high", "xhigh", "max"],
-      provider: "claude-code",
     });
   });
 

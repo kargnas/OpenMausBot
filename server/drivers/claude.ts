@@ -159,7 +159,7 @@ function readClaudeCatalog(cli: string, environment: Record<string, string>): Pr
           },
           options: [
             ...(!configuredModel
-              ? [{ id: "", label: "CLI default", ...(efforts.length ? { efforts } : {}), provider: "claude-code" }]
+              ? [{ id: "", label: "CLI default", ...(efforts.length ? { efforts } : {}) }]
               : []),
             ...ids.map((id) => ({
               id,
