@@ -8,11 +8,32 @@
 // status SUCCESS. Deterministic, no network.
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
+import { writeFileSync } from "node:fs";
+
 const argv = process.argv.slice(2);
 if (argv.includes("--version")) {
   console.log("1.1.12");
   process.exit(0);
 }
+if (argv.join(" ") === "models --output-format json") {
+  console.log(
+    JSON.stringify({
+      defaultModel: "fake-agy-pro",
+      defaultEffort: "high",
+      models: [
+        {
+          id: "fake-agy-pro",
+          name: "Fake Agy Pro",
+          efforts: ["low", "high"],
+          defaultEffort: "low",
+        },
+        { id: "fake-agy-flash", name: "Fake Agy Flash" },
+      ],
+    }),
+  );
+  process.exit(0);
+}
+if (process.env.FAKE_AGY_DUMP) writeFileSync(process.env.FAKE_AGY_DUMP, JSON.stringify({ argv }, null, 2));
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
 const CONV = "conv-fake-123";

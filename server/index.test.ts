@@ -291,6 +291,29 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("rejects malformed or unavailable model selections before persisting them", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const originalSelection = structuredClone(bot.modelSelection);
+    const persistedSelection = async () =>
+      (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === bot.id).modelSelection;
+
+    const malformed = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-model", effort: 7 },
+    });
+    expect(malformed).toMatchObject({ status: 400, body: { error: "invalid model selection" } });
+    expect(await persistedSelection()).toEqual(originalSelection);
+
+    const unavailable = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-model" },
+    });
+    expect(unavailable.status).toBe(409);
+    expect(unavailable.body.error).toContain("ghost");
+    expect(await persistedSelection()).toEqual(originalSelection);
+
+    await api("DELETE", `/api/bots/${bot.id}`);
+  });
+
   it("persists an answered onboarding card", async () => {
     const { body } = await api("GET", "/api/bots");
     const bot = body.bots[0];

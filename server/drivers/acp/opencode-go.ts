@@ -8,15 +8,6 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 
 const CATALOG_URL = "https://opencode.ai/zen/go/v1/models";
-const STATIC_MODELS: ModelCatalog = {
-  default: "opencode-go/minimax-m3",
-  options: [
-    { id: "opencode-go/minimax-m3", label: "Minimax M3" },
-    { id: "opencode-go/kimi-k3", label: "Kimi K3" },
-    { id: "opencode-go/glm-5.2", label: "GLM 5.2" },
-  ],
-};
-
 let lastSuccessfulCatalog: ModelCatalog | null = null;
 
 function labelForModel(id: string): string {
@@ -50,7 +41,7 @@ export async function fetchOpenCodeGoModels(fetcher: typeof fetch = fetch): Prom
         .filter((id): id is string => typeof id === "string" && /^[a-z0-9][a-z0-9._-]*$/i.test(id));
       if (!ids.length) throw new Error("catalog contained no valid models");
       const catalog = {
-        default: `opencode-go/${ids[0]}`,
+        default: { model: `opencode-go/${ids[0]}` },
         options: ids.map((id) => ({ id: `opencode-go/${id}`, label: labelForModel(id) })),
       } satisfies ModelCatalog;
       lastSuccessfulCatalog = catalog;
@@ -58,8 +49,9 @@ export async function fetchOpenCodeGoModels(fetcher: typeof fetch = fetch): Prom
     } finally {
       clearTimeout(timeout);
     }
-  } catch {
-    return lastSuccessfulCatalog ?? STATIC_MODELS;
+  } catch (error) {
+    if (lastSuccessfulCatalog) return lastSuccessfulCatalog;
+    throw error;
   }
 }
 
@@ -108,7 +100,6 @@ function hasStoredOpenCodeGoAuth(env: Record<string, string | undefined>) {
 const support = (fetcher: typeof fetch): AcpSupport => ({
   driverKind: "opencodeGo",
   displayName: "OpenCode Go",
-  models: STATIC_MODELS,
   defaultCli: "opencode",
   nativeSource: "opencode-go.acp",
   loginNote: "OpenCode Go is not configured — add an OPENCODE_API_KEY in OpenMausBot settings",

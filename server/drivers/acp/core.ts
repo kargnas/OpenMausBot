@@ -23,10 +23,10 @@ import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../proc
 import type {
   DriverCreateInput,
   EngineInstall,
+  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
-  ModelCatalog,
   RuntimeEvent,
   RuntimeEventListener,
   SendTurnInput,
@@ -55,10 +55,9 @@ export interface AcpConfig {
 export interface AcpSupport {
   driverKind: string;
   displayName: string;
-  models: { default: string; options: Array<{ id: string; label: string }> };
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
-  /** Optional live model catalog. A failed lookup keeps the last usable catalog. */
+  /** Optional provider-specific live model catalog. */
   resolveModels?(environment: Record<string, string | undefined>): ModelCatalog | Promise<ModelCatalog>;
   /** Native-protocol log label, e.g. "grok.acp". */
   nativeSource: string;
@@ -99,12 +98,20 @@ export interface AcpSupport {
     request: (method: string, params: unknown, timeoutMs?: number) => Promise<any>;
     sessionId: string;
     config: AcpConfig;
+    env: Record<string, string | undefined>;
     turn: SendTurnInput;
   }): Promise<void>;
+  applySelection?(
+    request: (method: string, params: unknown, timeoutMs?: number) => Promise<any>,
+    sessionId: string,
+    turn: SendTurnInput,
+  ): Promise<void>;
+  /** Use when initialize does not expose _meta.modelState.availableModels. */
+  catalog?(config: AcpConfig, env: Record<string, string | undefined>): Promise<ModelCatalog>;
 }
 
 const INIT_TIMEOUT = 20_000;
-const SESSION_CONFIG_TIMEOUT = 20_000; // configureSession's per-request default
+const SESSION_CONFIG_TIMEOUT = 20_000; // per-request default for session configuration
 const NEW_SESSION_TIMEOUT = 30_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
 const PROVIDER_CREDENTIAL_ENV = [
@@ -141,7 +148,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
     driverKind: DRIVER_KIND,
     metadata: { displayName: support.displayName, supportsMultipleInstances: true },
     install: support.install,
-    models: support.models,
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
 
@@ -160,17 +166,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         support.transformEnv?.(env, config);
         return env;
       };
-      let models = support.models;
-      const refreshModels = async () => {
-        if (!support.resolveModels) return;
-        try {
-          const resolved = await support.resolveModels(childEnv());
-          if (resolved.options.length) models = resolved;
-        } catch {
-          // Keep the last usable catalog when an optional discovery source is down.
-        }
-      };
-      await refreshModels();
       const listeners = new Set<RuntimeEventListener>();
       interface Turn {
         stop: () => void;
@@ -191,6 +186,93 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         createdAt: new Date().toISOString(),
       });
 
+      const catalog = async (): Promise<ModelCatalog> => {
+        const env = childEnv();
+        if (support.catalog) return support.catalog(config, env);
+        if (support.resolveModels) return support.resolveModels(env);
+        const probeTurn: SendTurnInput = { threadId: "catalog", text: "" };
+        const child = spawnCli(config.cli, support.spawnArgs(config, probeTurn), {
+          cwd: config.workspace ?? homedir(),
+          env,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        try {
+          const initialized = await new Promise<any>((resolve, reject) => {
+            let buffer = "";
+            let stderr = "";
+            const timer = setTimeout(() => reject(new Error(`${support.displayName} catalog probe timed out`)), INIT_TIMEOUT);
+            timer.unref?.();
+            child.stderr.on("data", (chunk) => {
+              stderr += chunk;
+              if (stderr.length > 4096) stderr = stderr.slice(-4096);
+            });
+            child.on("error", reject);
+            child.on("close", (code) =>
+              reject(new Error(`${support.displayName} catalog probe exited ${code}${stderr ? `: ${stderr.trim()}` : ""}`)),
+            );
+            child.stdout.on("data", (chunk) => {
+              buffer += chunk;
+              let newline;
+              while ((newline = buffer.indexOf("\n")) !== -1) {
+                const line = buffer.slice(0, newline);
+                buffer = buffer.slice(newline + 1);
+                if (!line.trim()) continue;
+                try {
+                  const message = JSON.parse(line);
+                  if (message.id !== 1) continue;
+                  clearTimeout(timer);
+                  if (message.error) reject(new Error(message.error.message ?? `${support.displayName} catalog probe failed`));
+                  else resolve(message.result);
+                  return;
+                } catch {
+                  // Ignore non-protocol output and keep reading the JSON-RPC stream.
+                }
+              }
+            });
+            child.stdin.write(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } },
+              }) + "\n",
+            );
+          });
+          const state = initialized?._meta?.modelState;
+          const options: ModelCatalog["options"] = (Array.isArray(state?.availableModels) ? state.availableModels : [])
+            .filter((model: any) => typeof model?.modelId === "string")
+            .map((model: any) => {
+              const effortMeta = model?._meta ?? {};
+              const efforts = Array.isArray(effortMeta.reasoningEfforts)
+                ? effortMeta.reasoningEfforts
+                    .map((effort: any) => effort?.value ?? effort?.id)
+                    .filter((effort: unknown): effort is string => typeof effort === "string")
+                : [];
+              return {
+                id: model.modelId,
+                label: typeof model.name === "string" ? model.name : model.modelId,
+                ...(efforts.length ? { efforts } : {}),
+                ...(typeof effortMeta.reasoningEffort === "string"
+                  ? { defaultEffort: effortMeta.reasoningEffort }
+                  : {}),
+              };
+            });
+          if (!options.length) throw new Error(`${support.displayName} initialize returned no model catalog`);
+          const model =
+            typeof state.currentModelId === "string" && options.some((option) => option.id === state.currentModelId)
+              ? state.currentModelId
+              : options[0].id;
+          const selected = options.find((option) => option.id === model)!;
+          return {
+            default: { model, ...(selected.defaultEffort ? { effort: selected.defaultEffort } : {}) },
+            options,
+          };
+        } finally {
+          killCliTree(child);
+        }
+      };
       // ACP session mcpServers: stdio is the baseline every ACP agent
       // supports (mcpCapabilities.http/.sse only add EXTRA transports), so
       // an injected stdio proxy — e.g. the peer-agent comms tool — attaches
@@ -552,15 +634,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 }
               }
 
+              const configRequest = (method: string, params: unknown, timeoutMs?: number) =>
+                request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT);
               if (support.configureSession) {
                 await support.configureSession({
-                  request: (method, params, timeoutMs) =>
-                    request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT),
+                  request: configRequest,
                   sessionId,
                   config,
+                  env,
                   turn,
                 });
               }
+              await support.applySelection?.(configRequest, sessionId, turn);
             } catch (error) {
               // session.started is the only place the resume cursor is recorded,
               // so a rejected setting must not orphan a session we just created.
@@ -632,10 +717,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         driverKind: DRIVER_KIND,
         displayName: input.displayName,
         enabled: input.enabled,
-        get models() {
-          return models;
-        },
-        refreshModels: support.resolveModels ? refreshModels : undefined,
+        catalog,
         snapshot,
         adapter: {
           provider: DRIVER_KIND,

@@ -37,21 +37,6 @@ export interface AntigravityConfig {
   fullAuto: boolean;
 }
 
-// model catalog from `agy models` (agy 1.1.12)
-const MODELS = {
-  default: "gemini-3.1-pro-high",
-  options: [
-    { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)" },
-    { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)" },
-    { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)" },
-    { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)" },
-    { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)" },
-    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" },
-    { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" },
-    { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)" },
-  ],
-};
-
 function decodeConfig(raw: unknown): AntigravityConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
   if (o.cli !== undefined && typeof o.cli !== "string") {
@@ -82,7 +67,6 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     },
     docsUrl: "https://github.com/google-antigravity/antigravity-cli#installation",
   },
-  models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
 
@@ -95,6 +79,61 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     // hang AFTER emitting `result` (so it's already removed from `active`), and
     // dispose()/stopAll() must still be able to reap it. Removed on process exit.
     const children = new Set<ChildProcess>();
+
+    const catalog = () =>
+      new Promise<any>((resolve, reject) => {
+        execCli(
+          config.cli,
+          ["models", "--output-format", "json"],
+          { timeout: 20_000, env: { ...process.env, ...input.environment, PATH: augmentedPath() } },
+          (error, stdout) => {
+            if (error) return reject(error);
+            try {
+              const payload = JSON.parse(stdout);
+              const listed = Array.isArray(payload) ? payload : payload?.models;
+              const options = (Array.isArray(listed) ? listed : [])
+                .map((raw: any) => {
+                  const id = typeof raw === "string" ? raw : raw?.id ?? raw?.model;
+                  if (typeof id !== "string") return null;
+                  const listedEfforts = raw?.efforts ?? raw?.supportedEfforts ?? raw?.supportedReasoningEfforts;
+                  const efforts = (Array.isArray(listedEfforts) ? listedEfforts : [])
+                    .map((effort: any) =>
+                      typeof effort === "string" ? effort : effort?.effort ?? effort?.reasoningEffort ?? effort?.id,
+                    )
+                    .filter((effort: unknown): effort is string => typeof effort === "string");
+                  return {
+                    id,
+                    label: typeof raw?.name === "string" ? raw.name : typeof raw?.displayName === "string" ? raw.displayName : id,
+                    ...(efforts.length ? { efforts } : {}),
+                    ...(typeof raw?.defaultEffort === "string" ? { defaultEffort: raw.defaultEffort } : {}),
+                  };
+                })
+                .filter((option: any): option is NonNullable<typeof option> => option !== null);
+              if (!options.length) throw new Error("Antigravity models returned no models");
+              const requested = typeof payload?.defaultModel === "string"
+                ? payload.defaultModel
+                : listed.find((model: any) => model?.default === true)?.id;
+              const model = requested && options.some((option: any) => option.id === requested)
+                ? requested
+                : options[0].id;
+              const selected = options.find((option: any) => option.id === model)!;
+              resolve({
+                default: {
+                  model,
+                  ...(typeof payload?.defaultEffort === "string"
+                    ? { effort: payload.defaultEffort }
+                    : selected.defaultEffort
+                      ? { effort: selected.defaultEffort }
+                      : {}),
+                },
+                options,
+              });
+            } catch (error) {
+              reject(error);
+            }
+          },
+        );
+      });
 
     const emit = (event: RuntimeEvent) => {
       for (const l of [...listeners]) l(event);
@@ -185,6 +224,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       ];
       if (!config.fullAuto) args.push("accept-edits");
       if (turn.model) args.push("--model", turn.model);
+      if (turn.effort) args.push("--effort", turn.effort);
       if (resumeCursor) args.push("--conversation", resumeCursor);
 
       const env: Record<string, string | undefined> = { ...process.env, PATH: augmentedPath() };
@@ -335,7 +375,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      catalog,
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
@@ -357,15 +397,6 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt: string) =>
-        new Promise((resolve, reject) => {
-          execCli(
-            config.cli,
-            ["-p", prompt, "--output-format", "text", "--model", "gemini-3.6-flash-low"],
-            { timeout: 60_000, env: { ...process.env, PATH: augmentedPath() } },
-            (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
-          );
-        }),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         reapChildren(true); // escalate to SIGKILL — disposal must reap every child

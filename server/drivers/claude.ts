@@ -8,7 +8,7 @@
 //   - Composio Connect (connected apps → tools) over streamable HTTP
 //   - the bot's cloud computer (box.ascii.dev) via server/computer-proxy.ts
 //     — screenshot/exec/open_url, the CUA-on-the-box bridge
-import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -20,6 +20,7 @@ import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli 
 
 import type {
   DriverCreateInput,
+  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -79,17 +80,6 @@ export interface ClaudeConfig {
   permissionMode: "acceptEdits" | "auto" | "bypassPermissions";
 }
 
-// model catalog ported from upstream packages/contracts/src/model.ts
-const MODELS = {
-  default: "claude-sonnet-5",
-  options: [
-    { id: "claude-fable-5", label: "Claude Fable 5" },
-    { id: "claude-opus-5", label: "Claude Opus 5" },
-    { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
-    { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
-  ],
-};
-
 // proxy entry files live next to this one as .ts in dev (node type
 // stripping) and .js in the compiled dist-server the packaged app ships
 const proxyPath = (basename: string) => {
@@ -135,6 +125,55 @@ function askSummary(ask: Ask): string {
 export function permissionSocketPath(threadId: string) {
   const tag = threadId.replace(/[^\w-]/g, "").slice(0, 8);
   return brokerSocketPath(DATA_DIR, tag);
+}
+
+function readClaudeCatalog(cli: string, environment: Record<string, string>): Promise<ModelCatalog> {
+  const env: Record<string, string | undefined> = { ...process.env, ...environment, PATH: augmentedPath() };
+  return new Promise((resolve, reject) => {
+    execCli(cli, ["--help"], { timeout: 20_000, env }, (error, stdout) => {
+      if (error) return reject(error);
+      try {
+        const modelBlock = /--model <model>([\s\S]*?)(?=\n\s{2,}--|\nCommands:|$)/.exec(stdout)?.[1] ?? "";
+        const aliases = [...modelBlock.matchAll(/['"]([a-zA-Z0-9._/-]+)['"]/g)].map((match) => match[1]);
+        const effortBlock = /--effort <level>([\s\S]*?)(?=\n\s{2,}--|\nCommands:|$)/.exec(stdout)?.[1] ?? "";
+        const efforts = /\(([^)]+)\)/
+          .exec(effortBlock)?.[1]
+          ?.split(",")
+          .map((effort) => effort.trim())
+          .filter(Boolean) ?? [];
+        let settings: Record<string, unknown> = {};
+        const configDir = env.CLAUDE_CONFIG_DIR || join(env.HOME || homedir(), ".claude");
+        try {
+          settings = JSON.parse(readFileSync(join(configDir, "settings.json"), "utf8"));
+        } catch {
+          // Missing settings means Claude owns the effective default.
+        }
+        const configuredModel = typeof settings.model === "string" ? settings.model : "";
+        if (configuredModel && !aliases.includes(configuredModel)) aliases.push(configuredModel);
+        const ids = [...new Set(aliases)];
+        if (!ids.length) throw new Error("Claude CLI help returned no model aliases");
+        resolve({
+          default: {
+            model: configuredModel,
+            ...(typeof settings.effortLevel === "string" ? { effort: settings.effortLevel } : {}),
+          },
+          options: [
+            ...(!configuredModel
+              ? [{ id: "", label: "CLI default", ...(efforts.length ? { efforts } : {}) }]
+              : []),
+            ...ids.map((id) => ({
+              id,
+              label: id.charAt(0).toUpperCase() + id.slice(1),
+              ...(efforts.length ? { efforts } : {}),
+              provider: "claude-code",
+            })),
+          ],
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
 }
 
 function createPermissionBroker(opts: {
@@ -257,7 +296,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     docsUrl: "https://claude.com/claude-code",
     signInCommand: "claude",
   },
-  models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
 
@@ -298,6 +336,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (sessionId) args.push("--resume", sessionId);
       else args.push("--session-id", newSessionId!);
       if (turn.model) args.push("--model", turn.model);
+      if (turn.effort) args.push("--effort", turn.effort);
       if (turn.system) args.push("--append-system-prompt", turn.system);
 
       // integrations → MCP servers; pre-allow their tools (a headless
@@ -556,7 +595,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      catalog: () => readClaudeCatalog(config.cli, input.environment),
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
@@ -580,15 +619,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt: string) =>
-        new Promise((resolve, reject) => {
-          execCli(
-            config.cli,
-            ["-p", prompt, "--model", "claude-haiku-4-5", "--output-format", "text"],
-            { timeout: 60_000, env: { ...process.env, PATH: augmentedPath() } },
-            (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
-          );
-        }),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         listeners.clear();

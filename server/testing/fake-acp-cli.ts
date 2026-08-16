@@ -50,8 +50,10 @@ const configOptions = () =>
       ]
     : null;
 const argv = process.argv.slice(2);
-if (process.env.FAKE_ACP_DUMP) {
-  const dumpEnv = Object.fromEntries(
+const calls: Array<{ method: string; params: unknown }> = [];
+const dump = () => {
+  if (!process.env.FAKE_ACP_DUMP) return;
+  const env = Object.fromEntries(
     [
       "PATH",
       "HOME",
@@ -66,10 +68,44 @@ if (process.env.FAKE_ACP_DUMP) {
       "XAI_API_KEY",
     ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
   );
-  writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify({ argv, env: dumpEnv }, null, 2));
+  writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify({ argv, env, calls }, null, 2));
+};
+dump();
+if (argv.join(" ") === "exec --help") {
+  if (process.env.FAKE_ACP_HELP_DUMP) writeFileSync(process.env.FAKE_ACP_HELP_DUMP, "called");
+  console.log(`Available Models:
+  auto                         Auto Model
+  claude-opus-5                Opus 5 (default)
+  claude-sonnet-5              Sonnet 5
+
+Model details:
+  - Auto Model: supports reasoning: No; supported: [none]; default: none
+  - Opus 5: supports reasoning: Yes; supported: [low, high, max]; default: high
+  - Sonnet 5: supports reasoning: Yes; supported: [low, medium, high]; default: high`);
+  process.exit(0);
 }
 if (argv.includes("--version")) {
   console.log("fake-acp 1.0.0");
+  process.exit(0);
+}
+if (argv.join(" ") === "provider list --json") {
+  console.log(
+    JSON.stringify({
+      providers: {},
+      models: {
+        "fake-kimi-1": {
+          displayName: "Fake Kimi One",
+          capabilities: ["thinking", "tool_use"],
+          supportEfforts: ["low", "high"],
+          defaultEffort: "low",
+        },
+        "fake-kimi-2": {
+          displayName: "Fake Kimi Two",
+          capabilities: [],
+        },
+      },
+    }),
+  );
   process.exit(0);
 }
 
@@ -175,6 +211,8 @@ function handle(msg: any) {
   }
   if (!msg.method) return;
   recordMethod(msg.method);
+  calls.push({ method: msg.method, params: msg.params ?? null });
+  dump();
 
   switch (msg.method) {
     case "initialize": {
@@ -183,7 +221,29 @@ function handle(msg: any) {
         process.exit(3);
       }
       const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
-      result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      result(msg.id, {
+        protocolVersion: 1,
+        authMethods,
+        _meta: {
+          modelState: {
+            currentModelId: "fake-acp-model",
+            availableModels: [
+              {
+                modelId: "fake-acp-model",
+                name: "Fake ACP Model",
+                _meta: {
+                  reasoningEffort: "high",
+                  reasoningEfforts: [
+                    { id: "low", value: "low" },
+                    { id: "high", value: "high" },
+                  ],
+                },
+              },
+              { modelId: "fake-acp-fast", name: "Fake ACP Fast" },
+            ],
+          },
+        },
+      });
       break;
     }
     case "authenticate":
@@ -237,6 +297,18 @@ function handle(msg: any) {
     }
     case "session/set_config_option": {
       const { configId, value } = msg.params ?? {};
+      if (configId === "reasoning_effort" && typeof value === "string") {
+        configCalls.push({ method: msg.method, params: msg.params });
+        if (process.env.FAKE_ACP_DUMP) {
+          writeFileSync(`${process.env.FAKE_ACP_DUMP}.config.json`, JSON.stringify(configCalls, null, 2));
+        }
+        result(msg.id, { configOptions: [] });
+        break;
+      }
+      if (configId === "thinking" && typeof value === "string") {
+        result(msg.id, { configOptions: [] });
+        break;
+      }
       if (configId !== "model" || !models.includes(value)) {
         out({
           jsonrpc: "2.0",

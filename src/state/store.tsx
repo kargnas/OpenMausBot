@@ -87,6 +87,8 @@ export interface Group {
 export interface ModelSelection {
   instanceId: string;
   model: string;
+  effort?: string;
+  serviceTier?: string | null;
 }
 
 /** One of a bot's separate contexts: its own thread, transcript and
@@ -195,7 +197,20 @@ export interface InstanceInfo {
     authenticated?: boolean;
     version?: string | null;
   };
-  models: { default: string; options: Array<{ id: string; label: string }> };
+  models: {
+    default: Omit<ModelSelection, "instanceId">;
+    options: Array<{
+      id: string;
+      label: string;
+      efforts?: string[];
+      defaultEffort?: string;
+      serviceTiers?: Array<{ id: string; label: string }>;
+      defaultServiceTier?: string | null;
+      toolUse?: boolean;
+      provider?: string;
+    }>;
+    error?: string;
+  };
   capabilities?: { computerMcp?: boolean; agentsMcp?: boolean };
   install?: EngineInstall;
 }
@@ -1323,25 +1338,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       const { instances } = await api("/api/instances");
       rawDispatch({ type: "instances", instances });
-    } catch {
-      /* offline or server down — the existing list stays */
+    } catch (error) {
+      rawDispatch({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      setTimeout(() => rawDispatch({ type: "error", message: null }), 6000);
+      throw error;
     }
   }, []);
 
-  // Installing a CLI or signing one in happens in a terminal, outside this
-  // window — so the moment the user comes back is exactly when our engine
-  // snapshot is most likely stale. Re-probe on focus, throttled so that
-  // ordinary alt-tabbing doesn't spawn a `--version` call per switch.
-  const lastFocusProbe = useRef(0);
+  // Keep the cached list visible while a periodic probe discovers CLI or
+  // account changes in the background.
   useEffect(() => {
-    const onFocus = () => {
-      const now = Date.now();
-      if (now - lastFocusProbe.current < 3000) return;
-      lastFocusProbe.current = now;
-      void refreshInstances();
-    };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    const timer = window.setInterval(() => void refreshInstances().catch(() => {}), 5 * 60_000);
+    return () => window.clearInterval(timer);
   }, [refreshInstances]);
 
   const value = useMemo(() => ({ state, dispatch, refreshInstances }), [state, dispatch, refreshInstances]);
