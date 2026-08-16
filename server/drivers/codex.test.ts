@@ -102,6 +102,63 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(turnStart.params.input[0].text).toBe("You are Testy.\n\nlist files");
   });
 
+  it("discovers models and effective defaults from the app-server", async () => {
+    await create();
+
+    await expect(instance.catalog()).resolves.toEqual({
+      default: { model: "fake-codex-1", effort: "high", serviceTier: "fast" },
+      options: [
+        {
+          id: "fake-codex-1",
+          label: "Fake Codex One",
+          efforts: ["low", "high"],
+          defaultEffort: "low",
+          serviceTiers: [
+            { id: "priority", label: "Fast" },
+            { id: "fast", label: "Fast" },
+          ],
+          defaultServiceTier: null,
+          provider: "codex",
+        },
+        {
+          id: "fake-codex-2",
+          label: "Fake Codex Two",
+          efforts: ["high"],
+          defaultEffort: "high",
+          serviceTiers: [],
+          defaultServiceTier: null,
+          provider: "codex",
+        },
+      ],
+    });
+  });
+
+  it("passes model, effort, and service tier to the app-server turn", async () => {
+    await create();
+    const dump = join(scratch, "selection.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-selection",
+      text: "go",
+      model: "fake-codex-1",
+      effort: "high",
+      serviceTier: "fast",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.find((call: any) => call.method === "thread/start").params).toMatchObject({
+      model: "fake-codex-1",
+      serviceTier: "fast",
+    });
+    expect(calls.find((call: any) => call.method === "turn/start").params).toMatchObject({
+      model: "fake-codex-1",
+      effort: "high",
+      serviceTier: "fast",
+    });
+  });
+
   it("streams agentMessage deltas without re-emitting the settled text", async () => {
     process.env.FAKE_CODEX_MODE = "stream";
     await create();
@@ -133,6 +190,34 @@ describe("CodexDriver turns (fake app-server)", () => {
     const methods = JSON.parse(readFileSync(dump, "utf8")).calls.map((c: { method: string }) => c.method);
     expect(methods).toContain("thread/resume");
     expect(methods).not.toContain("thread/start");
+  });
+
+  it("applies a changed model, effort, and service tier when resuming", async () => {
+    await create({ mode: "resume" });
+    const dump = join(scratch, "resume-selection.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-selection",
+      text: "again",
+      resumeCursor: "codex-thread-9",
+      model: "fake-codex-2",
+      effort: "high",
+      serviceTier: null,
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.find((call: any) => call.method === "thread/resume").params).toMatchObject({
+      threadId: "codex-thread-9",
+      model: "fake-codex-2",
+      serviceTier: null,
+    });
+    expect(calls.find((call: any) => call.method === "turn/start").params).toMatchObject({
+      model: "fake-codex-2",
+      effort: "high",
+      serviceTier: null,
+    });
   });
 
   it("falls back to a fresh thread when resume fails", async () => {

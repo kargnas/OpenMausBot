@@ -77,6 +77,53 @@ process.stdin.on("data", (chunk) => {
       case "thread/start":
         out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
         break;
+      case "model/list":
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            data: [
+              {
+                id: "fake-codex-1",
+                displayName: "Fake Codex One",
+                hidden: false,
+                supportedReasoningEfforts: [
+                  { reasoningEffort: "low" },
+                  { reasoningEffort: "high" },
+                ],
+                defaultReasoningEffort: "low",
+                additionalSpeedTiers: ["fast"],
+                serviceTiers: [{ id: "priority", name: "Fast" }],
+                defaultServiceTier: null,
+              },
+              {
+                id: "fake-codex-2",
+                displayName: "Fake Codex Two",
+                hidden: false,
+                supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+                defaultReasoningEffort: "high",
+                additionalSpeedTiers: [],
+                serviceTiers: [],
+                defaultServiceTier: null,
+              },
+            ],
+            nextCursor: null,
+          },
+        });
+        break;
+      case "config/read":
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            config: {
+              model: "fake-codex-1",
+              model_reasoning_effort: "high",
+              service_tier: "fast",
+            },
+          },
+        });
+        break;
       case "turn/start":
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
