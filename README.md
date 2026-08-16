@@ -195,9 +195,7 @@ installation, capabilities, and troubleshooting.
 git clone https://github.com/milind-soni/OpenMausBot && cd OpenMausBot
 pnpm install
 
-pnpm dev:server    # harness server → 127.0.0.1:8799
-pnpm dev           # app → http://127.0.0.1:5199
-pnpm dev:desktop   # Electron shell; keep the two commands above running
+pnpm dev:desktop   # server + Vite + Electron; the server restarts on crashes and source changes
 ```
 
 Requirements: **macOS, Windows, or Ubuntu 24.04 x64**, **Node 24+**, **pnpm**, and at least one agent CLI — [`claude`](https://claude.com/claude-code),
