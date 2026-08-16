@@ -34,6 +34,8 @@ export class ProviderError extends Error {
 export interface ModelSelection {
   instanceId: InstanceId;
   model: string;
+  effort?: string;
+  serviceTier?: string | null;
 }
 
 // ── instance configuration envelope ────────────────────────────────────
@@ -110,6 +112,10 @@ export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
   model?: string;
+  effort?: string;
+  serviceTier?: string | null;
+  /** Explicit remote harness provider. Never infer it from a model id. */
+  modelProvider?: string;
   resumeCursor?: unknown;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
@@ -202,8 +208,18 @@ export interface EngineInstall {
 // Failures must reject, never throw synchronously — the registry downgrades
 // a rejection to an unavailable shadow snapshot.
 export interface ModelCatalog {
-  default: string;
-  options: Array<{ id: string; label: string }>;
+  default: Omit<ModelSelection, "instanceId">;
+  options: Array<{
+    id: string;
+    label: string;
+    efforts?: string[];
+    defaultEffort?: string;
+    serviceTiers?: Array<{ id: string; label: string }>;
+    defaultServiceTier?: string | null;
+    toolUse?: boolean;
+    provider?: string;
+  }>;
+  error?: string;
 }
 
 export interface DriverCreateInput<Config> {
@@ -219,13 +235,9 @@ export interface ProviderInstance {
   readonly driverKind: DriverKind;
   readonly displayName: string | undefined;
   readonly enabled: boolean;
-  readonly models: ModelCatalog;
-  /** Refresh a live catalog without recreating the provider instance. */
-  readonly refreshModels?: () => Promise<void>;
+  catalog(): Promise<ModelCatalog>;
   readonly adapter: ProviderAdapter;
   snapshot(): Promise<ProviderSnapshot>;
-  /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries. */
-  generateText?(prompt: string): Promise<string>;
   dispose(): Promise<void>;
 }
 
@@ -238,7 +250,6 @@ export interface ProviderDriver<Config = unknown> {
   /** Decode the opaque config envelope; throw on invalid (→ shadow). */
   decodeConfig(raw: unknown): Config;
   defaultConfig(): Config;
-  readonly models: ModelCatalog;
   create(input: DriverCreateInput<Config>): Promise<ProviderInstance>;
 }
 
