@@ -132,6 +132,14 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
   });
 
+  it("falls back to the first visible model when the reported default is hidden", async () => {
+    await create({ mode: "hidden-default" });
+
+    const catalog = await instance.catalog();
+    expect(catalog.default).toEqual({ model: "fake-codex-1", effort: "low", serviceTier: null });
+    expect(catalog.options.map((option) => option.id)).toEqual(["fake-codex-1", "fake-codex-2"]);
+  });
+
   it("passes model, effort, and service tier to the app-server turn", async () => {
     await create();
     const dump = join(scratch, "selection.json");

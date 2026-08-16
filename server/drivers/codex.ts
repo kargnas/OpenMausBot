@@ -55,6 +55,8 @@ async function readCatalog(cli: string, environment: Record<string, string>): Pr
   };
   delete env.OPENAI_API_KEY;
   const child = spawnCli(cli, ["app-server"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
   let buffer = "";
   let nextId = 1;
   let stderr = "";
@@ -113,11 +115,15 @@ async function readCatalog(cli: string, environment: Record<string, string>): Pr
   try {
     await request("initialize", { clientInfo: { name: "openmausbot", version: "1" } });
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} }) + "\n");
-    const [listed, configured] = await Promise.all([
-      request("model/list", {}),
-      request("config/read", { includeLayers: false }),
-    ]);
-    const options: ModelCatalog["options"] = (Array.isArray(listed?.data) ? listed.data : [])
+    const listed: any[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await request("model/list", cursor ? { cursor } : {});
+      if (Array.isArray(page?.data)) listed.push(...page.data);
+      cursor = typeof page?.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
+    } while (cursor);
+    const configured = await request("config/read", { includeLayers: false });
+    const options: ModelCatalog["options"] = listed
       .filter((model: any) => typeof model?.id === "string" && model.hidden !== true)
       .map((model: any) => {
         const additionalSpeedTiers = Array.isArray(model.additionalSpeedTiers)
@@ -156,11 +162,12 @@ async function readCatalog(cli: string, environment: Record<string, string>): Pr
       });
     if (!options.length) throw new Error("codex model/list returned no visible models");
     const config = configured?.config ?? {};
-    const defaultModel =
-      (typeof config.model === "string" && options.some((option) => option.id === config.model)
-        ? config.model
-        : listed.data.find((model: any) => model?.isDefault === true)?.id) ?? options[0].id;
-    const option = options.find((candidate) => candidate.id === defaultModel)!;
+    const reportedDefault = listed.find((model) => model?.isDefault === true)?.id;
+    const option =
+      (typeof config.model === "string" ? options.find((candidate) => candidate.id === config.model) : undefined) ??
+      options.find((candidate) => candidate.id === reportedDefault) ??
+      options[0];
+    const defaultModel = option.id;
     return {
       default: {
         model: defaultModel,
