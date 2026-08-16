@@ -203,7 +203,11 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
                             <label className="text-[11px] text-ink-secondary">
                               Processing
                               <select
-                                value={selection.serviceTier ?? ""}
+                                value={
+                                  selection.serviceTier === undefined
+                                    ? option.defaultServiceTier ?? ""
+                                    : selection.serviceTier ?? ""
+                                }
                                 onChange={(event) => updateOption({ serviceTier: event.target.value || null })}
                                 className="mt-1 w-full rounded-md border border-hairline/50 bg-inset px-2 py-1 text-[12px] text-ink"
                               >
