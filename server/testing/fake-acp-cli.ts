@@ -71,6 +71,18 @@ const dump = () => {
   writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify({ argv, env, calls }, null, 2));
 };
 dump();
+if (argv.join(" ") === "exec --help") {
+  console.log(`Available Models:
+  auto                         Auto Model
+  claude-opus-5                Opus 5 (default)
+  claude-sonnet-5              Sonnet 5
+
+Model details:
+  - Auto Model: supports reasoning: No; supported: [none]; default: none
+  - Opus 5: supports reasoning: Yes; supported: [low, high, max]; default: high
+  - Sonnet 5: supports reasoning: Yes; supported: [low, medium, high]; default: high`);
+  process.exit(0);
+}
 if (argv.includes("--version")) {
   console.log("fake-acp 1.0.0");
   process.exit(0);
@@ -284,6 +296,14 @@ function handle(msg: any) {
     }
     case "session/set_config_option": {
       const { configId, value } = msg.params ?? {};
+      if (configId === "reasoning_effort" && typeof value === "string") {
+        configCalls.push({ method: msg.method, params: msg.params });
+        if (process.env.FAKE_ACP_DUMP) {
+          writeFileSync(`${process.env.FAKE_ACP_DUMP}.config.json`, JSON.stringify(configCalls, null, 2));
+        }
+        result(msg.id, { configOptions: [] });
+        break;
+      }
       if (configId === "thinking" && typeof value === "string") {
         result(msg.id, { configOptions: [] });
         break;

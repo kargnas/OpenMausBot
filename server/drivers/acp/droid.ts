@@ -19,6 +19,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { ModelCatalog } from "../../contracts.ts";
+import { execCli } from "../../procs.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 // FACTORY_HOME_OVERRIDE replaces the HOME the CLI resolves, NOT the data root:
@@ -48,7 +50,7 @@ function authFilePaths(env: Record<string, string | undefined>) {
 interface FactorySettings {
   customModels?: Array<{ id?: string; displayName?: string }>;
   modelFavorites?: string[];
-  sessionDefaultSettings?: { model?: string };
+  sessionDefaultSettings?: { model?: string; reasoningEffort?: string };
 }
 
 function readSettings(env: Record<string, string | undefined>): FactorySettings {
@@ -56,18 +58,46 @@ function readSettings(env: Record<string, string | undefined>): FactorySettings 
   return JSON.parse(readFileSync(join(home, ".factory", "settings.json"), "utf8")) as FactorySettings;
 }
 
-function resolveModels(env: Record<string, string | undefined>) {
+function catalogFromHelp(help: string, env: Record<string, string | undefined>): ModelCatalog {
+  const modelBlock = /Available Models:\s*\n([\s\S]*?)\n\s*Model details:/.exec(help)?.[1] ?? "";
+  const listed = modelBlock.split(/\r?\n/).flatMap((line) => {
+    const match = /^\s{2,}(\S+)\s{2,}(.+?)\s*$/.exec(line);
+    if (!match) return [];
+    const isDefault = /\s+\(default\)$/.test(match[2]);
+    return [{ id: match[1], label: match[2].replace(/\s+\(default\)$/, ""), isDefault }];
+  });
+  if (!listed.length) throw new Error("Droid CLI help returned no models");
+
+  const details = new Map<string, { efforts: string[]; defaultEffort: string }>();
+  for (const match of help.matchAll(
+    /^\s*-\s*(.+?): supports reasoning: (?:Yes|No); supported: \[([^\]]*)\]; default: (\S+)\s*$/gm,
+  )) {
+    details.set(match[1], {
+      efforts: match[2].split(",").map((effort) => effort.trim()).filter(Boolean),
+      defaultEffort: match[3],
+    });
+  }
+
   let settings: FactorySettings;
   try {
     settings = readSettings(env);
   } catch {
-    return MODELS; // no settings file yet, or unreadable: ship the built-ins
+    settings = {};
   }
 
-  const custom = (settings.customModels ?? []).flatMap((m) =>
+  const custom: ModelCatalog["options"] = (settings.customModels ?? []).flatMap((m) =>
     m.id ? [{ id: m.id, label: m.displayName || m.id }] : [],
   );
-  const merged = [...custom, ...MODELS.options.filter((o) => !custom.some((c) => c.id === o.id))];
+  const discovered: ModelCatalog["options"] = listed.map(({ id, label }) => {
+    const detail = details.get(label);
+    return {
+      id,
+      label,
+      ...(detail?.efforts.length ? { efforts: detail.efforts } : {}),
+      ...(detail?.defaultEffort ? { defaultEffort: detail.defaultEffort } : {}),
+    };
+  });
+  const merged = [...custom, ...discovered.filter((option) => !custom.some((entry) => entry.id === option.id))];
 
   // Favourites first, in the user's own order; everything else keeps its
   // existing order (Array.prototype.sort is stable).
@@ -75,11 +105,34 @@ function resolveModels(env: Record<string, string | undefined>) {
   const options = merged.sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
 
   const configured = settings.sessionDefaultSettings?.model;
-  const fallback = options[0]?.id ?? MODELS.default.model;
+  const cliDefault = listed.find((option) => option.isDefault)?.id;
+  const model = configured && options.some((option) => option.id === configured)
+    ? configured
+    : cliDefault && options.some((option) => option.id === cliDefault)
+      ? cliDefault
+      : options[0].id;
+  const selected = options.find((option) => option.id === model)!;
+  const configuredEffort = settings.sessionDefaultSettings?.reasoningEffort;
   return {
-    default: { model: configured && options.some((o) => o.id === configured) ? configured : fallback },
+    default: {
+      model,
+      ...(configuredEffort ? { effort: configuredEffort } : selected.defaultEffort ? { effort: selected.defaultEffort } : {}),
+    },
     options,
   };
+}
+
+function readDroidCatalog(cli: string, env: Record<string, string | undefined>): Promise<ModelCatalog> {
+  return new Promise((resolve, reject) => {
+    execCli(cli, ["exec", "--help"], { timeout: 20_000, env }, (error, stdout) => {
+      if (error) return reject(error);
+      try {
+        resolve(catalogFromHelp(stdout, env));
+      } catch (catalogError) {
+        reject(catalogError);
+      }
+    });
+  });
 }
 
 // droid answers a rejected setting with a bare JSON-RPC message ("Model not
@@ -107,26 +160,6 @@ async function applySetting(
 // would either make every session yolo or make fullAuto silently ask.
 const MODE_DEFAULT = "normal"; // auto-approves reads only; everything else asks
 const MODE_FULL_AUTO = "auto-high";
-
-// A curated slice of `droid exec -m <bogus>`'s built-in catalog (0.196.0 lists
-// 43). Custom models from ~/.factory/settings.json are per-machine and carry a
-// `custom:` prefix, so they can't be enumerated statically; a bot can still be
-// switched onto one through the model picker (PATCH /api/bots/:id).
-const MODELS = {
-  default: { model: "claude-opus-5" },
-  options: [
-    { id: "auto", label: "Auto (Factory picks)" },
-    { id: "claude-opus-5", label: "Claude Opus 5" },
-    { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
-    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
-    { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
-    { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
-    { id: "glm-5.2", label: "GLM 5.2" },
-    { id: "kimi-k3", label: "Kimi K3" },
-    { id: "grok-4.6", label: "Grok 4.6" },
-  ],
-};
 
 const support: AcpSupport = {
   driverKind: "droidAgent",
@@ -159,16 +192,24 @@ const support: AcpSupport = {
   // droid itself advertises, and it is checked last so an ambient key can
   // never be what makes an otherwise logged-out instance look ready.
   isAuthenticated: (env) => authFilePaths(env).some(existsSync) || Boolean(env.FACTORY_API_KEY),
-  resolveModels,
+  catalog: (config, env) => readDroidCatalog(config.cli, env),
 
-  async configureSession({ request, sessionId, config, turn }) {
+  async configureSession({ request, sessionId, config, env, turn }) {
     const modeId = config.fullAuto ? MODE_FULL_AUTO : MODE_DEFAULT;
     await applySetting(request, "session/set_mode", { sessionId, modeId }, `autonomy mode "${modeId}"`);
     // Pin the model for the same reason as the mode: with no set_model the
     // session runs whatever ~/.factory/settings.json selected, which can be a
     // `custom:` provider pointing at its own endpoint and key.
-    const modelId = turn.model || MODELS.default.model;
+    const modelId = turn.model || (await readDroidCatalog(config.cli, env)).default.model;
     await applySetting(request, "session/set_model", { sessionId, modelId }, `model "${modelId}"`);
+    if (turn.effort) {
+      await applySetting(
+        request,
+        "session/set_config_option",
+        { sessionId, configId: "reasoning_effort", value: turn.effort },
+        `reasoning effort "${turn.effort}"`,
+      );
+    }
   },
 
   // House convention for ACP harnesses (grok, gemini, kimi all do this): the

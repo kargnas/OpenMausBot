@@ -281,7 +281,12 @@ describe("ACP turns (fake CLI)", () => {
     const dump = join(scratch, "droid-dump.json");
     process.env.FAKE_ACP_DUMP = dump;
 
-    await instance.adapter.sendTurn({ threadId: "t-droid", text: "go", model: "claude-sonnet-5" });
+    await instance.adapter.sendTurn({
+      threadId: "t-droid",
+      text: "go",
+      model: "claude-sonnet-5",
+      effort: "max",
+    });
     await recorder.until((e) => e.type === "turn.completed");
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
@@ -292,6 +297,10 @@ describe("ACP turns (fake CLI)", () => {
     expect(applied).toEqual([
       { method: "session/set_mode", params: { sessionId: "fake-acp-session", modeId: "auto-high" } },
       { method: "session/set_model", params: { sessionId: "fake-acp-session", modelId: "claude-sonnet-5" } },
+      {
+        method: "session/set_config_option",
+        params: { sessionId: "fake-acp-session", configId: "reasoning_effort", value: "max" },
+      },
     ]);
   });
 
@@ -657,7 +666,7 @@ describe("ACP snapshot", () => {
           { id: "custom:Azure-Opus-0", displayName: "Azure Opus" },
         ],
         modelFavorites: ["custom:Azure-Opus-0", "custom:LMStudio-Qwen-0"],
-        sessionDefaultSettings: { model: "custom:LMStudio-Qwen-0" },
+        sessionDefaultSettings: { model: "custom:LMStudio-Qwen-0", reasoningEffort: "max" },
       }),
     );
 
@@ -676,14 +685,14 @@ describe("ACP snapshot", () => {
         { id: "custom:LMStudio-Qwen-0", label: "Qwen (local)" },
       ]);
       expect(catalog.options.some((o) => o.id === "claude-opus-5")).toBe(true);
-      expect(catalog.default.model).toBe("custom:LMStudio-Qwen-0");
+      expect(catalog.default).toEqual({ model: "custom:LMStudio-Qwen-0", effort: "max" });
     } finally {
       await instance.dispose();
       rmSync(scratch, { recursive: true, force: true });
     }
   });
 
-  it("droid falls back to the built-in catalog when settings.json is unreadable", async () => {
+  it("droid discovers the CLI catalog when settings.json is unreadable", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "omb-droid-nosettings-"));
     mkdirSync(join(scratch, ".factory"), { recursive: true });
     writeFileSync(join(scratch, ".factory", "settings.json"), "{ not json");
@@ -697,8 +706,13 @@ describe("ACP snapshot", () => {
     });
     try {
       const catalog = await instance.catalog();
-      expect(catalog.default.model).toBe("claude-opus-5");
+      expect(catalog.default).toEqual({ model: "claude-opus-5", effort: "high" });
       expect(catalog.options.every((o) => !o.id.startsWith("custom:"))).toBe(true);
+      expect(catalog.options.find((o) => o.id === "claude-opus-5")).toMatchObject({
+        label: "Opus 5",
+        efforts: ["low", "high", "max"],
+        defaultEffort: "high",
+      });
     } finally {
       await instance.dispose();
       rmSync(scratch, { recursive: true, force: true });

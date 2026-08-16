@@ -98,6 +98,7 @@ export interface AcpSupport {
     request: (method: string, params: unknown, timeoutMs?: number) => Promise<any>;
     sessionId: string;
     config: AcpConfig;
+    env: Record<string, string | undefined>;
     turn: SendTurnInput;
   }): Promise<void>;
   applySelection?(
@@ -637,6 +638,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT),
                   sessionId,
                   config,
+                  env,
                   turn,
                 });
               }
