@@ -171,7 +171,7 @@ describe("comms e2e (fake ACP fleet)", () => {
       // deterministic roster: hide the seeded bot, add Asker + Helper
       const seeded = (await api("GET", "/api/bots")).body.bots[0];
       await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
-      const selection = { instanceId: "grok", model: "fake-model" };
+      const selection = { instanceId: "grok", model: "fake-acp-model", effort: "high" };
       const helper = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${helper.id}`, { name: "Helper", modelSelection: selection });
       const asker = (await api("POST", "/api/bots")).body.bot;
