@@ -2,7 +2,7 @@
 // Routing is by exact instanceId only — an entry is never inferred from a
 // driver kind, and unavailable instances render disabled with the reason.
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, LoaderCircle } from "lucide-react";
+import { Check, ChevronDown, LoaderCircle, RefreshCw } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo } from "@/state/store";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsSignIn } from "./EngineSetup";
@@ -29,17 +29,13 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
     pickerInstances.find((i) => i.instanceId === (railId ?? selection.instanceId)) ??
     pickerInstances[0];
 
-  // Opening the picker is the user asking "what can I run?" — re-probe rather
-  // than answer from a snapshot taken at launch, which is stale the moment
-  // they install or sign in to anything.
-  useEffect(() => {
-    if (!open) return;
+  const refresh = () => {
     setRefreshError(null);
     setRefreshing(true);
     void refreshInstances()
       .catch((error) => setRefreshError(error instanceof Error ? error.message : String(error)))
       .finally(() => setRefreshing(false));
-  }, [open, refreshInstances]);
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -93,17 +89,6 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
           data-model-picker-content
           className="absolute right-0 top-full z-30 mt-2 flex w-[320px] overflow-hidden rounded-xl border border-hairline/50 bg-card shadow-2xl shadow-black/50"
         >
-          {refreshing && (
-            <div className="absolute inset-0 z-10 flex min-h-40 items-center justify-center gap-2 bg-card text-[13px] text-ink-secondary">
-              <LoaderCircle size={16} className="animate-spin" />
-              Refreshing models…
-            </div>
-          )}
-          {!refreshing && refreshError && (
-            <div className="absolute inset-x-0 top-0 z-10 bg-card px-3 py-2 text-[12px] text-red-400">
-              {refreshError}
-            </div>
-          )}
           {/* instance rail */}
           <div className="flex flex-col gap-1 border-r border-hairline/40 bg-panel p-2">
             {pickerInstances.map((instance) => {
@@ -138,15 +123,28 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
           <div className="min-w-0 flex-1 p-2">
             {railInstance ? (
               <>
-                <div className="px-2 pb-1 pt-1">
-                  <div className="text-[13px] font-semibold text-ink">{railInstance.displayName}</div>
-                  <div className="truncate text-[11px] text-ink-secondary">
-                    {railInstance.snapshot.state === "available" &&
-                    railInstance.snapshot.authenticated !== false
-                      ? (railInstance.snapshot.version ?? "ready")
-                      : (railInstance.snapshot.reason ?? "sign-in required")}
+                <div className="flex items-start justify-between gap-2 px-2 pb-1 pt-1">
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-semibold text-ink">{railInstance.displayName}</div>
+                    <div className="truncate text-[11px] text-ink-secondary">
+                      {railInstance.snapshot.state === "available" &&
+                      railInstance.snapshot.authenticated !== false
+                        ? (railInstance.snapshot.version ?? "ready")
+                        : (railInstance.snapshot.reason ?? "sign-in required")}
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={refresh}
+                    disabled={refreshing}
+                    aria-label="Refresh models"
+                    title="Refresh models"
+                    className="flex size-7 shrink-0 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink disabled:cursor-wait"
+                  >
+                    {refreshing ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                  </button>
                 </div>
+                {refreshError && <div className="px-2 py-1 text-[11px] text-red-400">{refreshError}</div>}
                 {railInstance.models.error && (
                   <div className="px-2 py-2 text-[12px] text-red-400">{railInstance.models.error}</div>
                 )}

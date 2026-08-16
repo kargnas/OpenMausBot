@@ -1345,20 +1345,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Installing a CLI or signing one in happens in a terminal, outside this
-  // window — so the moment the user comes back is exactly when our engine
-  // snapshot is most likely stale. Re-probe on focus, throttled so that
-  // ordinary alt-tabbing doesn't spawn a `--version` call per switch.
-  const lastFocusProbe = useRef(0);
+  // Keep the cached list visible while a periodic probe discovers CLI or
+  // account changes in the background.
   useEffect(() => {
-    const onFocus = () => {
-      const now = Date.now();
-      if (now - lastFocusProbe.current < 3000) return;
-      lastFocusProbe.current = now;
-      void refreshInstances().catch(() => {});
-    };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    const timer = window.setInterval(() => void refreshInstances().catch(() => {}), 5 * 60_000);
+    return () => window.clearInterval(timer);
   }, [refreshInstances]);
 
   const value = useMemo(() => ({ state, dispatch, refreshInstances }), [state, dispatch, refreshInstances]);
