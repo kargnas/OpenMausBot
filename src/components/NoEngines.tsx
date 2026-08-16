@@ -32,6 +32,8 @@ export function NoEngines() {
     setRechecking(true);
     try {
       await refreshInstances();
+    } catch {
+      // The shared store displays the request error.
     } finally {
       setRechecking(false);
     }
