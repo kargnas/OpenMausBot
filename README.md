@@ -61,8 +61,8 @@ already have:
 
 ### 🧠 Pick a brain per bot
 
-A model picker with a provider rail — the models reported by each installed CLI, with its configured default,
-supported effort levels, and processing tiers such as Codex Fast. The cached list stays visible while native
+A model picker with a provider rail — models reported by installed CLIs or supported provider APIs, with their
+configured defaults, effort levels, and processing tiers such as Codex Fast. The cached list stays visible while
 catalogs refresh manually or every five minutes. The server rejects unsupported model, effort, or tier selections
 and only attaches tools to capable models.
 
