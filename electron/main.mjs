@@ -17,6 +17,19 @@ const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
 let SERVER_PORT = 8799;
 const APP_ICON = path.join(__dirname, "resources/app-icon.png");
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  });
+}
+
 // GNOME groups the window with its installed desktop entry only when both
 // identities match. This must run before Electron becomes ready.
 if (process.platform === "linux") app.setDesktopName("com.openmausbot.app.desktop");
@@ -29,6 +42,7 @@ if (process.platform === "linux") app.setDesktopName("com.openmausbot.app.deskto
 // our API shape, not just a 200).
 let serverProc = null;
 let serverReady = true;
+let isQuitting = false;
 
 // The packaged app has no terminal: everything about the server child's life
 // goes to server.log in the OS log dir (~/Library/Logs/OpenMausBot on macOS,
@@ -79,7 +93,15 @@ async function startServerOn(port) {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       if (res.ok) {
         const body = await res.json().catch(() => null);
-        if (body?.app === "openmausbot" && body.pid === proc.pid && body.static) return proc;
+        // The child can exit while the response body is being parsed; an exit
+        // watcher registered after that point would never observe the event.
+        if (exited) return null;
+        if (body?.app === "openmausbot" && body.pid === proc.pid && body.static) {
+          proc.once("exit", () => {
+            if (!isQuitting) app.quit();
+          });
+          return proc;
+        }
         break; // someone else owns this port — try the next one
       }
     } catch {
@@ -285,7 +307,7 @@ ipcMain.handle("desktop:capabilities", async () =>
   }),
 );
 
-app.whenReady().then(async () => {
+if (gotSingleInstanceLock) app.whenReady().then(async () => {
   if (process.platform === "darwin") app.dock.setIcon(APP_ICON);
   // getDisplayMedia in the renderer → this handler → ScreenCaptureKit, all
   // inside the app's own processes — the one capture path macOS reliably
@@ -334,6 +356,7 @@ app.on("window-all-closed", () => {
 const CUA_STOP_TIMEOUT_MS = 2500;
 let cuaCleanedUp = false;
 app.on("before-quit", (e) => {
+  isQuitting = true;
   if (cuaCleanedUp) return;
   e.preventDefault();
   try {
