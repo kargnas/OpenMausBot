@@ -87,6 +87,8 @@ export interface Group {
 export interface ModelSelection {
   instanceId: string;
   model: string;
+  effort?: string;
+  serviceTier?: string | null;
 }
 
 /** One of a bot's separate contexts: its own thread, transcript and
@@ -195,7 +197,20 @@ export interface InstanceInfo {
     authenticated?: boolean;
     version?: string | null;
   };
-  models: { default: string; options: Array<{ id: string; label: string }> };
+  models: {
+    default: Omit<ModelSelection, "instanceId">;
+    options: Array<{
+      id: string;
+      label: string;
+      efforts?: string[];
+      defaultEffort?: string;
+      serviceTiers?: Array<{ id: string; label: string }>;
+      defaultServiceTier?: string | null;
+      toolUse?: boolean;
+      provider?: string;
+    }>;
+    error?: string;
+  };
   capabilities?: { computerMcp?: boolean; agentsMcp?: boolean };
   install?: EngineInstall;
 }
@@ -1323,8 +1338,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       const { instances } = await api("/api/instances");
       rawDispatch({ type: "instances", instances });
-    } catch {
-      /* offline or server down — the existing list stays */
+    } catch (error) {
+      rawDispatch({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      setTimeout(() => rawDispatch({ type: "error", message: null }), 6000);
+      throw error;
     }
   }, []);
 
@@ -1338,7 +1355,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const now = Date.now();
       if (now - lastFocusProbe.current < 3000) return;
       lastFocusProbe.current = now;
-      void refreshInstances();
+      void refreshInstances().catch(() => {});
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
