@@ -202,14 +202,26 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     },
     needsNode: true,
     docsUrl: "https://github.com/openai/codex",
-    signInCommand: "codex",
+    signInCommand: "codex login",
   },
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
 
   async create(input: DriverCreateInput<CodexConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const catalogEnv: Record<string, string | undefined> = { ...process.env, ...input.environment };
+    const childEnv = (): Record<string, string | undefined> => {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...input.environment,
+        PATH: augmentedPath(),
+        NPM_CONFIG_LOGLEVEL: "error",
+      };
+      // The CLI owns its own ChatGPT login; a leaked API key silently flips
+      // billing to pay-as-you-go (agentcal).
+      delete env.OPENAI_API_KEY;
+      return env;
+    };
+    const catalogEnv = childEnv();
     let models = STATIC_CODEX_MODELS;
     const refreshModels = async () => {
       // The app-server is the source of truth for ChatGPT-backed models and
@@ -267,15 +279,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
 
-      const env: Record<string, string | undefined> = {
-        ...process.env,
-        ...input.environment,
-        PATH: augmentedPath(),
-        NPM_CONFIG_LOGLEVEL: "error",
-      };
-      // the CLI owns its own ChatGPT login; a leaked API key silently flips
-      // billing to pay-as-you-go (agentcal)
-      delete env.OPENAI_API_KEY;
+      const env = childEnv();
 
       const child = spawnCli(config.cli, ["app-server", ...codexLocalProviderArgs(env, turn.model)], {
         cwd: turn.cwd ?? homedir(),
@@ -585,8 +589,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           });
         } catch (e) {
           if (!state.settled) {
-            emit({ ...base(threadId, turnId), type: "runtime.error", message: (e as Error).message });
-            settle(false, "rpc_error");
+            const message = e instanceof Error ? e.message : String(e);
+            const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(message);
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message,
+              ...(needsAuth ? { setup: true } : {}),
+            });
+            settle(false, needsAuth ? "auth_required" : "rpc_error");
           }
         }
       })();
@@ -595,13 +606,19 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
+      const env = childEnv();
       const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) =>
+        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
           resolve(err ? null : stdout.trim()),
         );
       });
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-      return { state: "available", version };
+      const authenticated = await new Promise<boolean>((resolve) => {
+        execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout) =>
+          resolve(!err && /logged in/i.test(stdout)),
+        );
+      });
+      return { state: "available", version, authenticated };
     };
 
     return {

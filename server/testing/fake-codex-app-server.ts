@@ -5,12 +5,26 @@
 // real app-server, it never exits on its own — the driver kills it.
 //
 //   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | hidden-default
+//                     | logged-out | unauthorized
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_CODEX_MODE ?? "happy";
+
+if (process.argv[2] === "--version") {
+  process.stdout.write("codex-cli 0.146.0\n");
+  process.exit(0);
+}
+if (process.argv[2] === "login" && process.argv[3] === "status") {
+  if (mode === "logged-out") {
+    process.stderr.write("Not logged in\n");
+    process.exit(1);
+  }
+  process.stdout.write("Logged in using ChatGPT\n");
+  process.exit(0);
+}
 const calls: Array<{ method: string; params: unknown }> = [];
 let decision: unknown = null;
 
@@ -141,6 +155,17 @@ process.stdin.on("data", (chunk) => {
         });
         break;
       case "turn/start":
+        if (mode === "unauthorized") {
+          out({
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: {
+              code: -32603,
+              message: "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+            },
+          });
+          break;
+        }
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         notify("item/started", { item: { id: "i1", type: "commandExecution", command: "ls -la" } });
         if (mode === "approval") {
