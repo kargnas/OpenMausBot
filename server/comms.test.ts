@@ -550,10 +550,11 @@ describe("comms e2e (fake ACP fleet)", () => {
       const helper = (await api("POST", "/api/bots")).body.bot;
       // a live engine whose CLI dies before the catalog probe answers —
       // startTurn rejects, so B's turn never starts
-      await api("PATCH", `/api/bots/${helper.id}`, {
+      const configured = await api("PATCH", `/api/bots/${helper.id}`, {
         name: "Helper",
         modelSelection: { instanceId: "helperNoCatalog", model: "fake-acp-model" },
       });
+      expect(configured.status).toBe(200);
       const asker = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${asker.id}`, {
         name: "Asker",
