@@ -19,7 +19,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { ModelCatalog } from "../../contracts.ts";
+import { isEffortLevel, type ModelCatalog } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
@@ -116,7 +116,11 @@ function catalogFromHelp(help: string, env: Record<string, string | undefined>):
   return {
     default: {
       model,
-      ...(configuredEffort ? { effort: configuredEffort } : selected.defaultEffort ? { effort: selected.defaultEffort } : {}),
+      ...(isEffortLevel(configuredEffort)
+        ? { effort: configuredEffort }
+        : isEffortLevel(selected.defaultEffort)
+          ? { effort: selected.defaultEffort }
+          : {}),
     },
     options,
   };

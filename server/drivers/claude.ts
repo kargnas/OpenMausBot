@@ -29,7 +29,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { computerProxyEnv } from "../container-computer.ts";
-import { newEventId, newId } from "../contracts.ts";
+import { isEffortLevel, newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 
 /** Whether `claude` has been signed in.
@@ -155,7 +155,7 @@ function readClaudeCatalog(cli: string, environment: Record<string, string>): Pr
         resolve({
           default: {
             model: configuredModel,
-            ...(typeof settings.effortLevel === "string" ? { effort: settings.effortLevel } : {}),
+            ...(isEffortLevel(settings.effortLevel) ? { effort: settings.effortLevel } : {}),
           },
           options: [
             ...(!configuredModel
@@ -343,11 +343,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // acceptEdits run silently denies anything unlisted)
       const mcpServers: Record<string, unknown> = {};
       const allowed: string[] = [];
-      if (turn.integrations?.composio?.key) {
+      if (turn.integrations?.composio) {
         mcpServers.composio = {
           type: "http",
-          url: turn.integrations.composio.url || "https://connect.composio.dev/mcp",
-          headers: { "x-consumer-api-key": turn.integrations.composio.key },
+          url: turn.integrations.composio.url,
+          headers: turn.integrations.composio.headers,
         };
         allowed.push("mcp__composio");
       }
@@ -599,7 +599,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session", agentsMcp: true, computerMcp: true, composioMcp: true },
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          computerMcp: true,
+          composioMcp: true,
+          effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),
         respondToRequest: async (threadId, requestId, decision) => {

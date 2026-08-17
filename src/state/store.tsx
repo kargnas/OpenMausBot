@@ -13,6 +13,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import type { EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
@@ -87,7 +88,7 @@ export interface Group {
 export interface ModelSelection {
   instanceId: string;
   model: string;
-  effort?: string;
+  effort?: EffortLevel;
   serviceTier?: string | null;
 }
 
@@ -165,7 +166,7 @@ export function messageVersions(bot: Bot, message: Message): Message[] {
 /** GET /api/config — configured flags only; secrets are never echoed. */
 export interface ConfigStatus {
   xai?: { configured: boolean };
-  composio: { configured: boolean; apiKeyConfigured?: boolean };
+  composio: { configured: boolean };
   box: { configured: boolean };
   opencodeGo?: { configured: boolean };
   /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
@@ -211,7 +212,7 @@ export interface InstanceInfo {
     }>;
     error?: string;
   };
-  capabilities?: { computerMcp?: boolean; agentsMcp?: boolean };
+  capabilities?: { computerMcp?: boolean; agentsMcp?: boolean; effortLevels?: readonly EffortLevel[] };
   install?: EngineInstall;
   /** Configured CLI path override — set ONLY when the user overrode it;
    * absent means the driver default is in effect. */
@@ -347,6 +348,7 @@ type Action =
           | "hidden"
           | "chiefOfStaff"
           | "approvePeerComms"
+          | "modelSelection"
         >
       >;
     };
@@ -522,7 +524,20 @@ function reducer(state: AppState, action: Action): AppState {
             ),
           }
         : animated;
-      return updateBot(next, action.bot.id, (b) => ({ ...b, ...action.bot, messages: b.messages }));
+      const switchedThread =
+        typeof action.bot.threadId === "string" && action.bot.threadId !== before.threadId;
+      return updateBot(next, action.bot.id, (b) => ({
+        ...b,
+        ...action.bot,
+        // Ordinary bot patches omit messages and must preserve the current
+        // transcript. A task switch is different: its full bot event carries
+        // the new transcript, which must replace the previous task before the
+        // webhook's streamed messages begin arriving.
+        messages:
+          switchedThread && Array.isArray(action.bot.messages)
+            ? action.bot.messages
+            : b.messages,
+      }));
     }
     case "messageAdded": {
       const bot = state.bots.find((b) => b.threadId === action.threadId);

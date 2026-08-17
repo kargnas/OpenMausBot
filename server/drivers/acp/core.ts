@@ -22,6 +22,7 @@ import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../proc
 
 import type {
   DriverCreateInput,
+  EffortLevel,
   EngineInstall,
   ModelCatalog,
   ProviderDriver,
@@ -32,7 +33,7 @@ import type {
   SendTurnInput,
   ProviderErrorCode,
 } from "../../contracts.ts";
-import { newEventId, newId } from "../../contracts.ts";
+import { isEffortLevel, newEventId, newId } from "../../contracts.ts";
 import { computerProxyEnv } from "../../container-computer.ts";
 import { augmentedPath } from "../../env-path.ts";
 
@@ -55,6 +56,11 @@ export interface AcpConfig {
 export interface AcpSupport {
   driverKind: string;
   displayName: string;
+  /** Effort levels this harness's CLI accepts, ascending. Omit when it has
+   * no reasoning-effort control. Static for the same reason `models` is:
+   * describe() runs before any session exists, so there is no _meta to read
+   * — eventually both should come from initialize's _meta.modelState. */
+  effortLevels?: readonly EffortLevel[];
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
   /** Optional provider-specific live model catalog. */
@@ -190,6 +196,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const env = childEnv();
         if (support.catalog) return support.catalog(config, env);
         if (support.resolveModels) return support.resolveModels(env);
+        // A failed probe must not veto turns: the catalog is advisory (the
+        // CLI makes the final call on a model id), so degrade to an empty
+        // catalog carrying the error instead of throwing.
+        return probeCatalog().catch((error: unknown) => ({
+          default: { model: "" },
+          options: [],
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      };
+
+      const probeCatalog = async (): Promise<ModelCatalog> => {
+        const env = childEnv();
         const probeTurn: SendTurnInput = { threadId: "catalog", text: "" };
         const child = spawnCli(config.cli, support.spawnArgs(config, probeTurn), {
           cwd: config.workspace ?? homedir(),
@@ -266,7 +284,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               : options[0].id;
           const selected = options.find((option) => option.id === model)!;
           return {
-            default: { model, ...(selected.defaultEffort ? { effort: selected.defaultEffort } : {}) },
+            default: { model, ...(isEffortLevel(selected.defaultEffort) ? { effort: selected.defaultEffort } : {}) },
             options,
           };
         } finally {
@@ -721,7 +739,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         snapshot,
         adapter: {
           provider: DRIVER_KIND,
-          capabilities: { sessionModelSwitch: "unsupported", agentsMcp: true, computerMcp: true },
+          capabilities: {
+            sessionModelSwitch: "unsupported",
+            agentsMcp: true,
+            computerMcp: true,
+            effortLevels: support.effortLevels,
+          },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),
           respondToRequest: async (threadId, requestId, decision) => {

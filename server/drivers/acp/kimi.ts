@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isEffortLevel } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
@@ -109,9 +110,9 @@ const support: AcpSupport = {
           resolve({
             default: {
               model,
-              ...(configuredEffort
+              ...(isEffortLevel(configuredEffort)
                 ? { effort: configuredEffort }
-                : selected.defaultEffort
+                : isEffortLevel(selected.defaultEffort)
                   ? { effort: selected.defaultEffort }
                   : {}),
             },

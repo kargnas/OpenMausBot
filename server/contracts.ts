@@ -28,13 +28,24 @@ export class ProviderError extends Error {
   }
 }
 
+/** Reasoning-effort levels, ascending. A union of everything any engine
+ * accepts; each driver declares the subset its CLI will take. */
+export const EFFORT_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Narrow untrusted API/config input before it becomes a model selection. */
+export function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+}
+
 // ── model selection ────────────────────────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
 // binding (upstream ModelSelectionWire). instanceId is the routing key.
 export interface ModelSelection {
   instanceId: InstanceId;
   model: string;
-  effort?: string;
+  /** Optional: no effort means no flag, and the CLI keeps its own default. */
+  effort?: EffortLevel;
   serviceTier?: string | null;
 }
 
@@ -112,7 +123,7 @@ export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
   model?: string;
-  effort?: string;
+  effort?: EffortLevel;
   serviceTier?: string | null;
   /** Explicit remote harness provider. Never infer it from a model id. */
   modelProvider?: string;
@@ -123,7 +134,7 @@ export interface SendTurnInput {
   system?: string;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
-    composio?: { url?: string; key: string };
+    composio?: { url: string; headers: Record<string, string> };
     /** Cloud computer, reached through OpenMausBot's REST-to-MCP adapter. */
     computer?: { kind?: "box"; boxId: string; token: string };
     /** Direct stdio connection to a Cua Driver MCP server (host or sandbox). */
@@ -160,6 +171,10 @@ export interface ProviderAdapter {
      * connected apps). Same rule again: a key in the config says the user
      * HAS those connections, not that this driver can reach them. */
     composioMcp?: boolean;
+    /** Effort levels this driver can pass to its CLI, ascending. Absent =
+     * the driver cannot set effort, so the app never offers the control —
+     * same rule as computerMcp: never show a knob the driver cannot turn. */
+    effortLevels?: readonly EffortLevel[];
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

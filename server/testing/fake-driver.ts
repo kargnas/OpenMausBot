@@ -3,6 +3,7 @@
 // canonical events as if the provider produced them.
 import type {
   DriverCreateInput,
+  EffortLevel,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -18,6 +19,8 @@ export interface FakeDriverOptions {
   failSnapshot?: string;
   /** catalog() rejects with this message (describe catalog-error path). */
   failCatalog?: string;
+  /** effort levels this fake driver declares, forwarded onto capabilities. */
+  effortLevels?: readonly EffortLevel[];
 }
 
 export interface FakeDriverHandle {
@@ -69,7 +72,7 @@ export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
           },
           adapter: {
             provider: kind,
-            capabilities: { sessionModelSwitch: "unsupported" },
+            capabilities: { sessionModelSwitch: "unsupported", effortLevels: opts.effortLevels },
             sendTurn: async () => ({ turnId: "fake-turn" }),
             interruptTurn: async () => {},
             respondToRequest: async () => {},

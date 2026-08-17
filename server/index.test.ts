@@ -5,7 +5,7 @@
 // the shadow-instance behavior end to end while it's at it.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, request, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,7 +60,22 @@ beforeAll(async () => {
     JSON.stringify({ instances: { ghost: { driver: "not-a-real-driver", displayName: "Ghost" } } }),
   );
 
-  boxStub = createServer((req, res) => {
+  boxStub = createServer(async (req, res) => {
+    if (req.url?.startsWith("/api/v3.1/tool_router/session")) {
+      if (req.headers["x-api-key"] !== "ak_good") {
+        res.writeHead(401, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "invalid project key" } }));
+      }
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const body = raw ? JSON.parse(raw) : {};
+      res.writeHead(201, { "content-type": "application/json" });
+      return res.end(JSON.stringify({
+        session_id: "trs_config_test",
+        mcp: { type: "http", url: "https://app.composio.dev/tool_router/v3/trs_config_test/mcp" },
+        config: { user_id: body.user_id },
+      }));
+    }
     const ok = req.headers.authorization === "Bearer box_good";
     res.writeHead(ok ? 200 : 401, { "content-type": "application/json" });
     res.end(JSON.stringify(ok ? { ok: true, boxes: [] } : { ok: false, code: "unauthorized" }));
@@ -78,6 +93,7 @@ beforeAll(async () => {
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
+      OMB_COMPOSIO_API: `http://127.0.0.1:${boxStubPort}/api/v3.1`,
       OMB_STATIC_DIR: staticDir,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -301,17 +317,97 @@ describe("harness HTTP API", () => {
     const malformed = await api("PATCH", `/api/bots/${bot.id}`, {
       modelSelection: { instanceId: "ghost", model: "ghost-model", effort: 7 },
     });
-    expect(malformed).toMatchObject({ status: 400, body: { error: "invalid model selection" } });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body.error).toContain("not recognized");
     expect(await persistedSelection()).toEqual(originalSelection);
 
-    const unavailable = await api("PATCH", `/api/bots/${bot.id}`, {
+    const malformedShape = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: 7, model: "ghost-model" },
+    });
+    expect(malformedShape).toMatchObject({ status: 400, body: { error: "invalid model selection" } });
+    expect(await persistedSelection()).toEqual(originalSelection);
+
+    // an offline engine keeps the whole request: the selection round-trips
+    // and startTurn re-checks it when the engine returns
+    const offline = await api("PATCH", `/api/bots/${bot.id}`, {
       modelSelection: { instanceId: "ghost", model: "ghost-model" },
     });
-    expect(unavailable.status).toBe(409);
-    expect(unavailable.body.error).toContain("ghost");
-    expect(await persistedSelection()).toEqual(originalSelection);
+    expect(offline.status).toBe(200);
+    expect(offline.body.bot.modelSelection).toEqual({ instanceId: "ghost", model: "ghost-model" });
 
     await api("DELETE", `/api/bots/${bot.id}`);
+  });
+
+  it("keeps the rest of a duplicate's fields when the source engine is offline", async () => {
+    // duplicateBot POSTs a blank bot, then PATCHes the source's whole
+    // modelSelection in one body beside its name, title and description.
+    // "ghost" is an unknown driver, so the registry resolves nothing and the
+    // level cannot be verified — which must not cost the copy everything
+    // else in the request.
+    const copy = (await api("POST", "/api/bots")).body.bot;
+
+    const patched = await api("PATCH", `/api/bots/${copy.id}`, {
+      name: "Reviewer copy",
+      title: "Reviewer",
+      description: "reads diffs",
+      modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "xhigh" },
+    });
+
+    expect(patched.status).toBe(200);
+    expect(patched.body.bot).toMatchObject({
+      name: "Reviewer copy",
+      title: "Reviewer",
+      description: "reads diffs",
+      modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "xhigh" },
+    });
+  });
+
+  it("rejects an unknown effort value even while the engine is offline", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const patched = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "turbo" },
+    });
+
+    expect(patched.status).toBe(400);
+    expect(patched.body.error).toContain("not recognized");
+  });
+
+  it("leaves a bot with no effort level untouched", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    expect(bot.modelSelection.effort).toBeUndefined();
+
+    const renamed = await api("PATCH", `/api/bots/${bot.id}`, { name: "Plain" });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.bot.modelSelection.effort).toBeUndefined();
+  });
+
+  // This fixture pins a single unknown driver, so no instance here ever
+  // resolves: these cover the gate's pass-through and the store's replace
+  // semantics, NOT the comparison against a live engine's declared list.
+  // That branch has no coverage at this layer, and manufacturing a live
+  // instance in this fixture would cost it its no-probe determinism.
+  it("round-trips an effort level and clears it when the key is dropped", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const selection = { instanceId: "ghost", model: "ghost-1" };
+
+    const set = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { ...selection, effort: "high" },
+    });
+    expect(set.status).toBe(200);
+    expect(set.body.bot.modelSelection.effort).toBe("high");
+
+    const reread = (await api("GET", "/api/bots")).body.bots.find((b: { id: string }) => b.id === bot.id);
+    expect(reread.modelSelection.effort).toBe("high");
+
+    // The panel's "Default" button spreads the selection with effort:
+    // undefined, and JSON.stringify drops the key — so clearing reaches the
+    // server as a modelSelection carrying no effort at all.
+    const cleared = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: selection });
+    expect(cleared.status).toBe(200);
+
+    const after = (await api("GET", "/api/bots")).body.bots.find((b: { id: string }) => b.id === bot.id);
+    expect(after.modelSelection).toEqual(selection);
+    expect(after.modelSelection.effort).toBeUndefined();
   });
 
   it("persists an answered onboarding card", async () => {
@@ -400,6 +496,30 @@ describe("harness HTTP API", () => {
     expect(nothing.status).toBe(400);
   });
 
+  it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
+    const oldKey = await api("PUT", "/api/config", { composio: { apiKey: "old_key" } });
+    expect(oldKey.status).toBe(400);
+    expect(oldKey.body.error).toMatch(/start with ak_/i);
+
+    const rejected = await api("PUT", "/api/config", { composio: { apiKey: "ak_wrong" } });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error).toMatch(/invalid project key/i);
+
+    const saved = await api("PUT", "/api/config?secretStorage=external", { composio: { apiKey: "ak_good" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.composio).toEqual({ configured: true });
+    expect(JSON.stringify(saved.body)).not.toContain("ak_good");
+
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.composio).toMatchObject({ apiKey: "", sessionId: "trs_config_test" });
+    expect(JSON.stringify(disk)).not.toContain("ak_good");
+
+    // A later ordinary setting save reloads config; the in-process secure-env
+    // override must keep Composio configured until the next app launch.
+    expect((await api("PUT", "/api/config", { profile: { name: "Grace" } })).status).toBe(200);
+    expect((await api("GET", "/api/config")).body.composio).toEqual({ configured: true });
+  });
+
   it.skipIf(process.platform === "win32")("stores the credentials file with owner-only permissions", () => {
     expect(statSync(join(home, ".openmausbot", "config.json")).mode & 0o777).toBe(0o600);
   });
@@ -484,6 +604,48 @@ describe("harness HTTP API", () => {
     const array = await api("PUT", "/api/config", { opencodeGo: [] });
     expect(array.status).toBe(400);
     expect(array.body.error).toContain("opencodeGo");
+  });
+
+  it("never hands a client the provider session cursors", async () => {
+    // resumeCursors is the harness's own bookkeeping. It reached clients for
+    // a long time as harmless noise; once a phone is a client it is provider
+    // session state leaving the machine, so nothing carrying a bot may have it.
+    const listed = await api("GET", "/api/bots");
+    for (const bot of listed.body.bots) {
+      expect(bot).not.toHaveProperty("resumeCursors");
+      for (const task of bot.tasks ?? []) expect(task).not.toHaveProperty("resumeCursors");
+    }
+
+    const created = await api("POST", "/api/bots");
+    const botId = created.body.bot.id;
+    try {
+      expect(created.body.bot).not.toHaveProperty("resumeCursors");
+      const patched = await api("PATCH", `/api/bots/${botId}`, { name: "Cursorless" });
+      expect(patched.body.bot).not.toHaveProperty("resumeCursors");
+
+      const task = await api("POST", `/api/bots/${botId}/tasks`, {});
+      expect(task.body.bot).not.toHaveProperty("resumeCursors");
+      for (const t of task.body.bot.tasks ?? []) expect(t).not.toHaveProperty("resumeCursors");
+      // the task alone, not just the bot it came attached to
+      expect(task.body.task).not.toHaveProperty("resumeCursors");
+      const renamed = await api("PATCH", `/api/bots/${botId}/tasks/${task.body.task.threadId}`, {
+        title: "Cursorless task",
+      });
+      expect(renamed.body.task).not.toHaveProperty("resumeCursors");
+
+      // and the same on the wire, not just in the HTTP responses
+      const stream = await openSse(`${BASE}/api/events`);
+      try {
+        await api("PATCH", `/api/bots/${botId}`, { unread: true });
+        const frame = await stream.until((f) => f.kind === "bot");
+        expect(frame.bot).not.toHaveProperty("resumeCursors");
+        expect(JSON.stringify(frame)).not.toContain("resumeCursors");
+      } finally {
+        stream.close();
+      }
+    } finally {
+      await api("DELETE", `/api/bots/${botId}`);
+    }
   });
 
   it("404s unknown routes with the route in the error", async () => {

@@ -8,6 +8,11 @@ import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsSignIn } from "./EngineSetup";
 import { cn } from "@/lib/cn";
 
+// app tsconfig은 server/contracts.ts의 값 import를 허용하지 않으므로
+// EffortLevel 가드를 UI에 로컬로 둔다 (동일 6레벨 목록)
+const isEffortLevel = (value: unknown): value is NonNullable<Bot["modelSelection"]["effort"]> =>
+  typeof value === "string" && ["none", "low", "medium", "high", "xhigh", "max"].includes(value);
+
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   return (instance?.models.options.find((o) => o.id === model)?.label ?? model) || "CLI default";
 }
@@ -52,13 +57,23 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
   }, [open]);
 
   const pick = (instance: InstanceInfo, option: InstanceInfo["models"]["options"][number]) => {
+    // setModel replaces the whole selection, so a configured effort has to be
+    // carried across deliberately. Same engine, different model: keep the
+    // user's level — silently resetting it is not what "pick a model" means.
+    // Different engine: take the option's catalog default, since effort
+    // vocabularies are per-driver.
+    const sameInstance = instance.instanceId === selection.instanceId;
     dispatch({
       type: "setModel",
       botId: bot.id,
       selection: {
         instanceId: instance.instanceId,
         model: option.id,
-        ...(option.defaultEffort ? { effort: option.defaultEffort } : {}),
+        ...(sameInstance && selection.effort
+          ? { effort: selection.effort }
+          : isEffortLevel(option.defaultEffort)
+            ? { effort: option.defaultEffort }
+            : {}),
         ...(option.serviceTiers?.length ? { serviceTier: option.defaultServiceTier ?? null } : {}),
       },
     });
@@ -66,7 +81,13 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
   };
 
   const updateOption = (patch: { effort?: string; serviceTier?: string | null }) => {
-    dispatch({ type: "setModel", botId: bot.id, selection: { ...selection, ...patch } });
+    const { effort: rawEffort, ...rest } = patch;
+    const effort = rawEffort !== undefined && isEffortLevel(rawEffort) ? rawEffort : undefined;
+    dispatch({
+      type: "setModel",
+      botId: bot.id,
+      selection: { ...selection, ...rest, ...(effort !== undefined ? { effort } : {}) },
+    });
   };
 
   return (
