@@ -142,11 +142,9 @@ describe("Antigravity turns (fake CLI)", () => {
     rmSync(scratch, { recursive: true, force: true });
   });
 
-  it("rejects respondToRequest — no interactive permission channel", async () => {
+  it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
-    await expect(
-      instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" }),
-    ).rejects.toThrow(/no interactive permission channel/);
+    await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
   });
 });
 
