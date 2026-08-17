@@ -6,21 +6,86 @@
 // loadSession:true (session/load resume works), mcpCapabilities http+sse,
 // and a full session/new → session/prompt roundtrip streams
 // agent_thought_chunk + agent_message_chunk and settles with end_turn.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { execCli } from "../../procs.ts";
+import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
+import type { ModelCatalog } from "../../contracts.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
-
-function credentialsPath(env: Record<string, string | undefined>) {
-  const dataRoot = env.KIMI_CODE_HOME || join(env.HOME || homedir(), ".kimi-code");
-  return join(dataRoot, "credentials", "kimi-code.json");
-}
 
 function configPath(env: Record<string, string | undefined>) {
   const dataRoot = env.KIMI_CODE_HOME || join(env.HOME || homedir(), ".kimi-code");
   return join(dataRoot, "config.toml");
+}
+
+function kimiDataRoot(env: Record<string, string | undefined>): string {
+  return env.KIMI_CODE_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".kimi-code");
+}
+
+function credentialsPath(env: Record<string, string | undefined>) {
+  return join(kimiDataRoot(env), "credentials", "kimi-code.json");
+}
+
+function quoteToml(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function quoteTomlKey(key: string): string {
+  if (/^[A-Za-z0-9_-]+$/.test(key)) return key;
+  return quoteToml(key);
+}
+
+function hasTomlTable(text: string, heading: string): boolean {
+  return text.split(/\r?\n/).some((line) => line.trim() === heading);
+}
+
+/** Write [providers.host] + [models."host/alias"] so `kimi -m` hits the local host. */
+export function ensureKimiInjectAlias(
+  modelId: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const inject = decodeInjectId(modelId);
+  if (!inject) return modelId;
+  const host = localHost(inject.host);
+  if (!host) return modelId;
+
+  const alias = `${inject.host}/${inject.model.replace(/\//g, "-")}`;
+  const dataRoot = kimiDataRoot(env);
+  mkdirSync(dataRoot, { recursive: true });
+  const path = join(dataRoot, "config.toml");
+  let text = "";
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    text = "";
+  }
+
+  const providerHeading = `[providers.${inject.host}]`;
+  const modelHeading = `[models.${quoteTomlKey(alias)}]`;
+  const blocks: string[] = [];
+  if (!hasTomlTable(text, providerHeading)) {
+    blocks.push(
+      [
+        providerHeading,
+        `type = "openai_legacy"`,
+        `base_url = ${quoteToml(host.baseUrl)}`,
+        `api_key = ${quoteToml(hostApiKey(host, env))}`,
+        "",
+      ].join("\n"),
+    );
+  }
+  if (!hasTomlTable(text, modelHeading)) {
+    blocks.push(
+      [modelHeading, `provider = ${quoteToml(inject.host)}`, `model = ${quoteToml(inject.model)}`, ""].join("\n"),
+    );
+  }
+  if (blocks.length) {
+    const prefix = text && !text.endsWith("\n") ? `${text}\n\n` : text ? `${text}\n` : "";
+    writeFileSync(path, `${prefix}${blocks.join("\n")}`);
+  }
+  return alias;
 }
 
 const support: AcpSupport = {
@@ -72,8 +137,9 @@ const support: AcpSupport = {
   // KIMI_CODE_HOME must not be checked against the server user's home instead.
   isAuthenticated: (env) => existsSync(credentialsPath(env)),
 
-  catalog: (config, env) =>
-    new Promise((resolve, reject) => {
+  catalog: async (config, env) =>
+    mergeLocalInject(
+      await new Promise<ModelCatalog>((resolve, reject) => {
       execCli(config.cli, ["provider", "list", "--json"], { timeout: 20_000, env }, (error, stdout) => {
         if (error) return reject(error);
         try {
@@ -121,7 +187,9 @@ const support: AcpSupport = {
           reject(error);
         }
       });
-    }),
+      }),
+      env,
+    ),
 
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };

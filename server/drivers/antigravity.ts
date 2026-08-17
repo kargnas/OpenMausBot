@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 import { DATA_DIR } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
+import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
 import type { ChildProcess } from "node:child_process";
 import type {
@@ -80,8 +81,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     // dispose()/stopAll() must still be able to reap it. Removed on process exit.
     const children = new Set<ChildProcess>();
 
-    const catalog = () =>
-      new Promise<any>((resolve, reject) => {
+    const catalog = async () =>
+      mergeLocalInject(
+        await new Promise<any>((resolve, reject) => {
         execCli(
           config.cli,
           ["models", "--output-format", "json"],
@@ -133,7 +135,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
             }
           },
         );
-      });
+        }),
+        { ...process.env, ...input.environment },
+      );
 
     const emit = (event: RuntimeEvent) => {
       for (const l of [...listeners]) l(event);
@@ -223,11 +227,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         config.fullAuto ? "--dangerously-skip-permissions" : "--mode",
       ];
       if (!config.fullAuto) args.push("accept-edits");
-      if (turn.model) args.push("--model", turn.model);
+      if (turn.model) args.push("--model", injectedApiModel(turn.model) ?? turn.model);
       if (turn.effort) args.push("--effort", turn.effort);
       if (resumeCursor) args.push("--conversation", resumeCursor);
 
-      const env: Record<string, string | undefined> = { ...process.env, PATH: augmentedPath() };
+      const env = { ...process.env, PATH: augmentedPath() };
 
       // spawnCli resolves npm .cmd shims / shebang scripts on Windows and
       // owns the process-group vs windowsHide difference (see procs.ts)

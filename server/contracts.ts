@@ -213,6 +213,7 @@ export interface ModelCatalog {
     id: string;
     label: string;
     custom?: boolean;
+    loaded?: boolean;
     efforts?: string[];
     defaultEffort?: string;
     serviceTiers?: Array<{ id: string; label: string }>;
@@ -242,9 +243,18 @@ export interface ProviderInstance {
   dispose(): Promise<void>;
 }
 
+/** How an engine is presented in the picker rail.
+ *  `subscription` — first-party cloud catalog; Custom is extra.
+ *  `custom` — no subscription catalog; Custom is the product. */
+export type EngineAccess = "subscription" | "custom";
+
 export interface ProviderDriver<Config = unknown> {
   readonly driverKind: DriverKind;
-  readonly metadata: { displayName: string; supportsMultipleInstances?: boolean };
+  readonly metadata: {
+    displayName: string;
+    supportsMultipleInstances?: boolean;
+    access?: EngineAccess;
+  };
   /** How to get this engine installed. Omit for engines that need no local
    * binary (API-key drivers), which is what makes it optional. */
   readonly install?: EngineInstall;

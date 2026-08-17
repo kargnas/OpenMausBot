@@ -55,6 +55,9 @@ export interface AcpConfig {
 export interface AcpSupport {
   driverKind: string;
   displayName: string;
+  /** Omit for subscription CLIs (the default). Custom-only CLIs sit below
+   *  the picker-rail divider and have no first-party cloud catalog. */
+  access?: "subscription" | "custom";
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
   /** Optional provider-specific live model catalog. */
@@ -90,6 +93,13 @@ export interface AcpSupport {
   classifyError?(error: unknown): ProviderErrorCode | undefined;
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
+  /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
+   * and session/select. Local inject writers live here so the child sees a
+   * model it already knows. */
+  resolveTurnModel?(
+    model: string | undefined,
+    env: Record<string, string | undefined>,
+  ): string | undefined;
   /** Apply per-session settings between session/new (or session/load) and the
    * first session/prompt. Some CLIs ignore argv and take the model/mode over
    * the wire instead (droid), so this is the only place the pick can land; a
@@ -146,7 +156,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
   return {
     driverKind: DRIVER_KIND,
-    metadata: { displayName: support.displayName, supportsMultipleInstances: true },
+    metadata: {
+      displayName: support.displayName,
+      supportsMultipleInstances: true,
+      access: support.access ?? "subscription",
+    },
     install: support.install,
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
@@ -349,9 +363,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const turnId = newId();
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
+        const resolvedModel = support.resolveTurnModel?.(turn.model, env);
+        const cliTurn =
+          resolvedModel !== undefined && resolvedModel !== turn.model
+            ? { ...turn, model: resolvedModel }
+            : turn;
         const mcpServers = acpMcpServers(turn);
 
-        const child = spawnCli(config.cli, support.spawnArgs(config, turn), {
+        const child = spawnCli(config.cli, support.spawnArgs(config, cliTurn), {
           cwd,
           env,
           stdio: ["pipe", "pipe", "pipe"],
@@ -640,7 +659,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ...base(threadId, turnId),
                 type: "session.started",
                 sessionId,
-                model: selectedModel ?? init?._meta?.modelState?.currentModelId ?? turn.model ?? null,
+                model: selectedModel ?? init?._meta?.modelState?.currentModelId ?? cliTurn.model ?? null,
               });
             };
 
@@ -651,19 +670,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   (Array.isArray(r?.configOptions) ? r.configOptions : []).find((o: any) => o?.id === configId)
                     ?.currentValue ?? null;
                 selectedModel = currentOf(sessionResult);
-                if (turn.model && turn.model !== selectedModel) {
+                if (cliTurn.model && cliTurn.model !== selectedModel) {
                   selectedModel = currentOf(
                     await request(
                       "session/set_config_option",
-                      { sessionId, configId, value: turn.model },
+                      { sessionId, configId, value: cliTurn.model },
                       INIT_TIMEOUT,
                     ),
                   );
                   // an agent that answers OK but keeps its old model is worse than
                   // one that errors: it burns a paid turn on the wrong thing
-                  if (selectedModel !== turn.model) {
+                  if (selectedModel !== cliTurn.model) {
                     throw new Error(
-                      `${DRIVER_KIND} did not switch to ${turn.model} (still ${selectedModel ?? "unknown"})`,
+                      `${DRIVER_KIND} did not switch to ${cliTurn.model} (still ${selectedModel ?? "unknown"})`,
                     );
                   }
                 }
@@ -677,7 +696,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   sessionId,
                   config,
                   env,
-                  turn,
+                  turn: cliTurn,
                 });
               }
               await support.applySelection?.(configRequest, sessionId, turn);

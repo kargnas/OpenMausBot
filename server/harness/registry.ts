@@ -143,6 +143,7 @@ export class ProviderRegistry {
             models: { default: { model: "" }, options: [] },
             capabilities: { computerMcp: false, agentsMcp: false },
             // an unknown driver has no driver record, hence no install path
+            access: driver?.metadata.access ?? "subscription",
             install: driver?.install,
             cli: entry.shadow.cli,
             cliDefault: cliDefaultOf(driver),
@@ -178,6 +179,7 @@ export class ProviderRegistry {
             computerMcp: inst.adapter.capabilities.computerMcp === true,
             agentsMcp: inst.adapter.capabilities.agentsMcp === true,
           },
+          access: driver?.metadata.access ?? "subscription",
           install: driver?.install,
           cli: this.cliByInstance.get(inst.instanceId),
           cliDefault: cliDefaultOf(driver),
