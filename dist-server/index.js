@@ -12,8 +12,9 @@ import * as box from "./box.js";
 import * as composio from "./composio.js";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.js";
 import { containerComputerAction, containerComputerMcp, containerComputerScreenshot, containerComputerStatus, setupCommands, } from "./container-computer.js";
-import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.js";
-import { resetPathCache } from "./env-path.js";
+import { ensureDirs, instanceConfigs, loadConfig, saveConfig, withInstanceCli, EVENTS_DIR, NATIVE_DIR } from "./config.js";
+import { augmentedPath, findCliCandidates, resetPathCache, splitCliString } from "./env-path.js";
+import { describeSpawnFailure, execCli } from "./procs.js";
 import { buildNotification } from "./notify.js";
 import { isEffortLevel } from "./contracts.js";
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.js";
@@ -22,6 +23,7 @@ import { discardDelegations, drainDelegations, queueDelegation } from "./delegat
 import { EventBus } from "./harness/bus.js";
 import { ProviderRegistry } from "./harness/registry.js";
 import { cancelPeerApprovalsFor, dismissStalePeerCards, requestPeerApproval, resolvePeerComms } from "./peer-approval.js";
+import { modelSupportsTools, selectedModel } from "./models.js";
 import { mentionedBots, roomResponders, Store, } from "./store.js";
 import * as tts from "./tts/index.js";
 import { narrateTool, toUtterances } from "./tts/speech-text.js";
@@ -119,14 +121,14 @@ function askBotAndWait(targetBotId, message, depth, fromBotId) {
 // default selection for new bots: first available instance, claude preferred
 async function defaultSelection() {
     const described = await registry.describe();
-    const available = described.filter((d) => d.snapshot.state === "available");
+    const available = described.filter((d) => d.snapshot.state === "available" && d.models.options.length > 0);
     // Deliberately NO fallback to described[0]. Handing a bot an engine whose
     // CLI isn't installed makes it look ready and then fail on send with a raw
     // spawn ENOENT — the single worst first-run experience, and the one every
     // user with no CLIs used to get. An empty selection is honest: the UI shows
     // the setup path instead of a bot that cannot answer.
     const pick = available.find((d) => d.driverKind === "claudeAgent") ?? available[0];
-    return { instanceId: pick?.instanceId ?? "", model: pick?.models.default ?? "" };
+    return { instanceId: pick?.instanceId ?? "", ...(pick?.models.default ?? { model: "" }) };
 }
 let bootSelection = { instanceId: "", model: "" };
 const store = new Store(() => bootSelection);
@@ -714,16 +716,40 @@ async function startTurn(botId, text, opts) {
     // a task takes its name from the first thing you asked it to do
     if (text.trim())
         store.titleTaskFromFirstMessage(bot.id, text, threadId);
+    const sourceInstance = registry.get(bot.modelSelection.instanceId);
+    if (!sourceInstance) {
+        throw Object.assign(new Error(`provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`), { status: 409 });
+    }
     const instance = opts?.runOn === "cloud"
         ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-        : registry.get(bot.modelSelection.instanceId);
+        : sourceInstance;
     if (!instance) {
         throw Object.assign(new Error(opts?.runOn === "cloud"
             ? "the Cloud VM runner is unavailable — configure Box in App Settings"
             : `provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`), { status: 409 });
     }
+    // The catalog is account-driven and probed on demand, so a model can be
+    // missing from it while the CLI would happily accept it (a test fleet's
+    // synthetic ids, a CLI updated past the probe). Validate combinations
+    // (effort/tier) only against a model the catalog knows; model existence
+    // is the CLI's call at spawn time.
+    let modelOption;
+    try {
+        const catalog = await sourceInstance.catalog();
+        if (catalog.options.some((option) => option.id === bot.modelSelection.model)) {
+            modelOption = selectedModel(bot.modelSelection, catalog);
+        }
+    }
+    catch (error) {
+        throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { status: 409 });
+    }
+    if (opts?.runOn === "cloud" && modelOption && !modelOption.provider) {
+        throw Object.assign(new Error(`model "${bot.modelSelection.model}" cannot run on the cloud computer`), { status: 409 });
+    }
     const instanceId = instance.instanceId;
-    const model = opts?.runOn === "cloud" ? instance.models.default : bot.modelSelection.model;
+    const model = opts?.runOn === "cloud"
+        ? (await instance.catalog()).default.model
+        : bot.modelSelection.model;
     // a cloud routine borrows the instance default model, so it borrows no
     // per-bot effort either
     const effort = opts?.runOn === "cloud" ? undefined : bot.modelSelection.effort;
@@ -792,8 +818,9 @@ async function startTurn(botId, text, opts) {
             if (dwebUrl)
                 integrations.dweb = { url: dwebUrl };
             const wants = opts?.runOn === "cloud" ? "cloud" : bot.computer; // cloud routine overrides the MAUS default
-            const mountsComputerMcp = instance.adapter.capabilities.computerMcp === true;
-            const mountsCloudComputer = mountsComputerMcp || instance.driverKind === "boxAgent";
+            const supportsTools = modelOption ? modelSupportsTools(modelOption) : true;
+            const mountsComputerMcp = instance.adapter.capabilities.computerMcp === true && supportsTools;
+            const mountsCloudComputer = (mountsComputerMcp || instance.driverKind === "boxAgent") && supportsTools;
             let previewBoxId = null;
             let computerKind = null;
             // Explicit destinations are strict. In particular, Local VM must never
@@ -884,6 +911,7 @@ async function startTurn(botId, text, opts) {
             // still be the TARGET of ask_bot regardless of its driver.
             if (commsDepth < MAX_COMMS_DEPTH &&
                 instance.adapter.capabilities.agentsMcp === true &&
+                supportsTools &&
                 store.bots.filter((b) => b.id !== bot.id && !b.hidden).length > 0) {
                 integrations.agents = agentsIntegration(bot.id, threadId, commsDepth);
             }
@@ -903,6 +931,8 @@ async function startTurn(botId, text, opts) {
                 text: turnText,
                 model,
                 effort,
+                serviceTier: bot.modelSelection.serviceTier,
+                modelProvider: modelOption?.provider,
                 // a rewound thread never resumes the abandoned branch's session
                 // the active task's own session — another task's cursor would
                 // resume the wrong conversation and defeat the context bubble
@@ -1074,6 +1104,20 @@ spoken = new Set()) {
         broadcast({ kind: "message", threadId: group.threadId, message: failure });
         return;
     }
+    let modelOption;
+    try {
+        modelOption = selectedModel(bot.modelSelection, await instance.catalog());
+    }
+    catch (error) {
+        const failure = store.appendMessage(group.threadId, {
+            role: "bot",
+            kind: "activity",
+            from: { botId: bot.id, name: bot.name, color: bot.color },
+            tool: { name: `error: ${error instanceof Error ? error.message.slice(0, 140) : "model unavailable"}`, ok: false },
+        });
+        broadcast({ kind: "message", threadId: group.threadId, message: failure });
+        return;
+    }
     store.patchGroup(group.id, { busyBotId: bot.id });
     broadcastGroup(group.id);
     groupSpeakers.set(group.threadId, { botId: bot.id, name: bot.name, color: bot.color });
@@ -1116,7 +1160,15 @@ spoken = new Set()) {
         });
         const timer = setTimeout(finish, 5 * 60_000);
         instance.adapter
-            .sendTurn({ threadId: group.threadId, text, system })
+            .sendTurn({
+            threadId: group.threadId,
+            text,
+            system,
+            model: bot.modelSelection.model,
+            effort: bot.modelSelection.effort,
+            serviceTier: bot.modelSelection.serviceTier,
+            modelProvider: modelOption?.provider,
+        })
             .catch((err) => {
             const failure = store.appendMessage(group.threadId, {
                 role: "bot",
@@ -1173,6 +1225,46 @@ function startGroupTurn(groupId, text) {
         }
     });
     groupQueues.set(groupId, next.catch(() => { }));
+}
+/** Pre-save probe for a CLI path override: run `<cli> --version` with the
+ * same environment a real turn gets (augmented PATH). Returns ok + the
+ * version line, or a fail the UI can act on — ENOENT on a GUI-launched app
+ * usually means "not on the app's PATH", the exact mistake this catches
+ * before the override is saved. */
+async function testCliBinary(cli, driver) {
+    return new Promise((resolve) => {
+        execCli(cli, ["--version"], {
+            timeout: 10_000,
+            // SIGKILL, not SIGTERM: a child that traps TERM (sh -c "trap '' TERM;
+            // sleep 99999") would otherwise never fire the callback and pin the
+            // HTTP socket forever. maxBuffer bounds a chatty --version too.
+            killSignal: "SIGKILL",
+            maxBuffer: 1024 * 64,
+            env: { ...process.env, PATH: augmentedPath() },
+        }, (err, stdout) => {
+            if (err) {
+                const e = err;
+                // err.code is an errno CONSTANT ("ENOENT", "EACCES") only for spawn
+                // failures; for a non-zero exit it's the exit STATUS (a number) and
+                // for a timeout it's null + killed:true — describeSpawnFailure words
+                // only the first kind
+                const isSpawnError = typeof e.code === "string";
+                const message = isSpawnError
+                    ? describeSpawnFailure(e, cli).message
+                    : e.killed
+                        ? "CLI test timed out after 10s"
+                        : `CLI exited with error ${String(e.code)}: ${(stderrOf(err) || "").slice(0, 200) || err.message.split("\n")[0]}`;
+                resolve({ ok: false, message, ...(driver?.install && isSpawnError ? { install: driver.install } : {}) });
+                return;
+            }
+            resolve({ ok: true, version: stdout.trim().split("\n")[0] });
+        });
+    });
+}
+/** execFile's error carries the child's stderr in .stderr. */
+function stderrOf(err) {
+    const s = err.stderr;
+    return typeof s === "string" ? s : Buffer.isBuffer(s) ? s.toString("utf8") : "";
 }
 function configStatus() {
     return {
@@ -1839,9 +1931,44 @@ const server = createServer(async (req, res) => {
                 }
             }
             const patch = {};
-            for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"]) {
+            for (const key of ["name", "title", "description", "notifications", "unread", "computer", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"]) {
                 if (body[key] !== undefined)
                     patch[key] = body[key];
+            }
+            if (body.modelSelection !== undefined) {
+                const raw = body.modelSelection;
+                if (!raw ||
+                    typeof raw !== "object" ||
+                    typeof raw.instanceId !== "string" ||
+                    typeof raw.model !== "string" ||
+                    (raw.effort !== undefined && typeof raw.effort !== "string") ||
+                    (raw.serviceTier !== undefined && raw.serviceTier !== null && typeof raw.serviceTier !== "string")) {
+                    return json(res, 400, { error: "invalid model selection" });
+                }
+                const selection = {
+                    instanceId: raw.instanceId,
+                    model: raw.model,
+                    ...(isEffortLevel(raw.effort) ? { effort: raw.effort } : {}),
+                    ...(raw.serviceTier !== undefined ? { serviceTier: raw.serviceTier } : {}),
+                };
+                // Combination validation (effort/tier against the chosen model) only
+                // when the engine is live AND the model is in its catalog: an offline
+                // engine must not cost the request everything (duplicateBot re-sends
+                // the whole selection), and a model missing from the catalog is
+                // startTurn's 409 to raise — the PATCH path stays permissive.
+                const selectedInstance = registry.get(raw.instanceId);
+                if (selectedInstance) {
+                    try {
+                        const catalog = await selectedInstance.catalog();
+                        if (catalog.options.some((option) => option.id === selection.model)) {
+                            selectedModel(selection, catalog);
+                        }
+                    }
+                    catch {
+                        /* a catalog probe failure must not block persisting a selection */
+                    }
+                }
+                patch.modelSelection = selection;
             }
             if (body.computer !== undefined &&
                 !["cloud", "vm", "local", "off"].includes(String(body.computer))) {
@@ -2168,6 +2295,68 @@ const server = createServer(async (req, res) => {
             // run?", and the interesting case is a CLI installed since launch.
             // Windows never pushes PATH changes into a live process, so without
             // this the answer is frozen at boot and "check again" is a no-op.
+            resetPathCache();
+            return json(res, 200, { instances: await registry.describe() });
+        }
+        // ── CLI binary discovery for the Engines "detected" dropdown ──
+        // ?name=claude → absolute paths of every `claude` on the augmented PATH,
+        // in PATH order (first = what a bare name runs). Polled when the user
+        // opens the Custom picker so a just-installed CLI appears without a restart.
+        if (method === "GET" && path === "/api/cli-candidates") {
+            const name = url.searchParams.get("name") ?? "";
+            resetPathCache();
+            return json(res, 200, { candidates: findCliCandidates(name) });
+        }
+        // ── pre-save CLI probe: does this path actually run? ──
+        // POST {cli, driver} → spawn `<cli> --version` with the same PATH the
+        // turn itself would use. A miss here (typo, missing exec bit, a binary
+        // the GUI app can't see) means every turn would fail, so the UI asks
+        // before saving rather than registering a dead engine.
+        if (method === "POST" && path === "/api/cli-test") {
+            // same gate as the local-VM lifecycle routes: this executes a local
+            // binary, so a hostile page must not be able to submit it as a simple
+            // text/plain cross-origin request
+            if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+                return json(res, 415, { error: "content-type must be application/json" });
+            }
+            const body = await readBody(req);
+            const cli = typeof body?.cli === "string" ? body.cli.trim() : "";
+            if (!cli || /[\n\r]/.test(cli))
+                return json(res, 400, { error: "cli must be a non-empty path" });
+            const driver = typeof body?.driver === "string" ? BUILT_IN_DRIVERS.find((d) => d.driverKind === body.driver) : undefined;
+            // probe ONLY the head token: `cli` may be a wrapper string with fixed
+            // args ("ag claude agp"), but letting the caller choose argv would
+            // make this route a one-line env exfil ("printenv XAI_API_KEY")
+            const head = splitCliString(cli)[0];
+            const probe = await testCliBinary(head || cli, driver);
+            return json(res, 200, probe);
+        }
+        // ── per-instance CLI path override (custom builds / versioned bins) ──
+        // PATCH /api/instances/:id {cli: "/path/to/cli" | ""} — "" reverts to the
+        // driver default. Kills in-flight turns like any provider reload.
+        const instancePatch = /^\/api\/instances\/([\w.-]+)$/.exec(path);
+        if (method === "PATCH" && instancePatch) {
+            // same non-simple-request gate as the local-VM lifecycle routes
+            if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+                return json(res, 415, { error: "content-type must be application/json" });
+            }
+            const body = await readBody(req);
+            if (typeof body?.cli !== "string")
+                return json(res, 400, { error: "cli must be a string" });
+            if (/[\n\r]/.test(body.cli))
+                return json(res, 400, { error: "cli must not contain newlines" });
+            const result = withInstanceCli(cfg, instancePatch[1], body.cli);
+            if (!result.ok)
+                return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
+            // persist the whole instances map this rebuild produced — a fresh
+            // saveConfig({instances}) merge would re-derive defaults identically,
+            // but writing the resolved map keeps disk and runtime in lockstep
+            saveConfig({ instances: result.config.instances });
+            Object.assign(cfg, loadConfig());
+            await reloadProviders();
+            // rescan BEFORE describe(): the response's cliCandidates are computed
+            // from the memoized PATH, so resetting after would answer this request
+            // with the pre-reset cache
             resetPathCache();
             return json(res, 200, { instances: await registry.describe() });
         }

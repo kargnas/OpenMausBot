@@ -58,8 +58,63 @@ export function saveConfig(patch) {
             disk[key] = { ...disk[key], ...patch[key] };
         }
     }
+    if (patch.instances && typeof patch.instances === "object") {
+        const diskInstances = (disk.instances ?? {});
+        for (const [instanceId, entry] of Object.entries(patch.instances)) {
+            diskInstances[instanceId] = { ...diskInstances[instanceId], ...entry };
+        }
+        disk.instances = diskInstances;
+    }
     mkdirSync(DATA_DIR, { recursive: true });
     writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
+}
+/** Set one instance's `config.cli` ("" clears the override back to the
+ * driver default). Creating the instance entry is fine — a config-less
+ * entry rides driver.defaultConfig(). Returns false for unknown instances
+ * when the fleet is explicitly configured. The returned map must stay
+ * PERSISTABLE: instanceConfigs() injects credential env into every entry
+ * for the live fleet, so those injected keys are stripped back out before
+ * the map is returned — otherwise saving an override would copy xai/box/
+ * opencodeGo secrets into the instances section of config.json. */
+export function withInstanceCli(cfg, instanceId, cli) {
+    const next = structuredClone(cfg);
+    const injected = injectedEnvironment(next);
+    const map = instanceConfigs(next);
+    // hasOwn, not truthiness: map is a plain object literal, so
+    // map["__proto__"] resolves to Object.prototype — truthy — and the
+    // assignment below would poison EVERY object in the process (instanceId
+    // comes off the URL, where `__proto__` passes the route's [\w.-]+ regex)
+    if (!Object.hasOwn(map, instanceId))
+        return { ok: false, config: cfg };
+    const entry = map[instanceId];
+    const cliKey = cli.trim();
+    if (cliKey)
+        entry.config = { ...entry.config, cli: cliKey };
+    else if (entry.config && typeof entry.config === "object" && "cli" in entry.config) {
+        const rest = { ...entry.config };
+        delete rest.cli;
+        entry.config = Object.keys(rest).length ? rest : undefined;
+    }
+    for (const e of Object.values(map)) {
+        if (!e.environment)
+            continue;
+        for (const [k, v] of Object.entries(e.environment)) {
+            if (injected[k] === v)
+                delete e.environment[k];
+        }
+        if (!Object.keys(e.environment).length)
+            delete e.environment;
+    }
+    next.instances = map;
+    return { ok: true, config: next };
+}
+/** The credential env instanceConfigs() injects — same keys, same rule. */
+function injectedEnvironment(cfg) {
+    return {
+        ...(cfg.xai?.key ? { XAI_API_KEY: cfg.xai.key } : {}),
+        ...(cfg.box?.token ? { BOX_TOKEN: cfg.box.token } : {}),
+        ...(cfg.opencodeGo?.apiKey ? { OPENCODE_API_KEY: cfg.opencodeGo.apiKey } : {}),
+    };
 }
 // Default fleet: one instance per built-in driver (upstream
 // defaultInstanceIdForDriver — instanceId defaults to the driver kind).

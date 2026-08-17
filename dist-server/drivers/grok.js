@@ -2,14 +2,6 @@ import { newEventId, newId } from "../contracts.js";
 import { appendNative } from "./native.js";
 const DRIVER_KIND = "grok";
 const DEFAULT_URL = "https://api.x.ai/v1";
-const MODELS = {
-    default: "grok-4",
-    options: [
-        { id: "grok-4", label: "Grok 4" },
-        { id: "grok-4-fast", label: "Grok 4 Fast" },
-        { id: "grok-3-mini", label: "Grok 3 Mini" },
-    ],
-};
 function decodeConfig(raw) {
     const o = (raw ?? {});
     return {
@@ -21,7 +13,6 @@ export const GrokDriver = {
     driverKind: DRIVER_KIND,
     // "(API)" distinguishes this key-billed driver from grokAgent, the CLI one
     metadata: { displayName: "Grok (API)", supportsMultipleInstances: true },
-    models: MODELS,
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
     async create(input) {
@@ -29,6 +20,23 @@ export const GrokDriver = {
         const apiKey = input.environment[config.apiKeyEnv] ?? process.env[config.apiKeyEnv] ?? "";
         const listeners = new Set();
         const active = new Map();
+        const catalog = async () => {
+            if (!apiKey)
+                throw new Error(`no xAI key — set ${config.apiKeyEnv} or config.json xai.key`);
+            const response = await fetch(`${config.url}/models`, {
+                headers: { authorization: `Bearer ${apiKey}` },
+                signal: AbortSignal.timeout(20_000),
+            });
+            if (!response.ok)
+                throw new Error(`xAI models HTTP ${response.status}`);
+            const payload = await response.json();
+            const options = (Array.isArray(payload?.data) ? payload.data : [])
+                .filter((model) => typeof model?.id === "string")
+                .map((model) => ({ id: model.id, label: model.id }));
+            if (!options.length)
+                throw new Error("xAI models returned no models");
+            return { default: { model: options[0].id }, options };
+        };
         const emit = (event) => {
             for (const l of [...listeners])
                 l(event);
@@ -102,6 +110,9 @@ export const GrokDriver = {
             const { threadId } = turn;
             if (!apiKey)
                 throw new Error(`no xAI key — set ${config.apiKeyEnv} or config.json xai.key`);
+            if (!turn.model)
+                throw new Error("model selection is required");
+            const selectedModel = turn.model;
             if (active.has(threadId))
                 throw new Error("a turn is already running on this thread");
             const turnId = newId();
@@ -117,10 +128,10 @@ export const GrokDriver = {
             ];
             appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messages } });
             emit({ ...base(threadId, turnId), type: "turn.started" });
-            emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model: turn.model ?? MODELS.default });
+            emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model: turn.model });
             (async () => {
                 try {
-                    const { text, usage } = await complete(messages, turn.model || MODELS.default, {
+                    const { text, usage } = await complete(messages, selectedModel, {
                         stream: true,
                         signal: abort.signal,
                         onDelta: (delta) => emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta }),
@@ -166,7 +177,7 @@ export const GrokDriver = {
             driverKind: DRIVER_KIND,
             displayName: input.displayName,
             enabled: input.enabled,
-            models: MODELS,
+            catalog,
             snapshot,
             adapter: {
                 provider: DRIVER_KIND,
@@ -185,10 +196,6 @@ export const GrokDriver = {
                     listeners.add(listener);
                     return () => listeners.delete(listener);
                 },
-            },
-            generateText: async (prompt) => {
-                const { text } = await complete([{ role: "user", content: prompt }], "grok-3-mini", { stream: false });
-                return text;
             },
             dispose: async () => {
                 for (const { abort } of active.values())

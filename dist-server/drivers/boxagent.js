@@ -2,15 +2,6 @@ import { newEventId, newId } from "../contracts.js";
 import { appendNative } from "./native.js";
 const DRIVER_KIND = "boxAgent";
 const BOX_API = "https://ascii.dev/api/box/v1";
-const MODELS = {
-    default: "claude-fable-5",
-    options: [
-        { id: "claude-fable-5", label: "Claude Fable 5 · on the box" },
-        { id: "sonnet", label: "Claude Sonnet · on the box" },
-        { id: "gpt-5.4", label: "GPT-5.4 (Codex) · on the box" },
-    ],
-};
-const providerFor = (model) => (model.startsWith("gpt") ? "codex" : "claude-code");
 function decodeConfig(raw) {
     const o = (raw ?? {});
     return { pollMs: typeof o.pollMs === "number" ? o.pollMs : 2500 };
@@ -18,7 +9,6 @@ function decodeConfig(raw) {
 export const BoxAgentDriver = {
     driverKind: DRIVER_KIND,
     metadata: { displayName: "Computer", supportsMultipleInstances: false },
-    models: MODELS,
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
     async create(input) {
@@ -58,10 +48,13 @@ export const BoxAgentDriver = {
             if (!boxId) {
                 throw new Error("this bot has no computer yet — open the Computer panel and provision one");
             }
+            if (!turn.model || !turn.modelProvider) {
+                throw new Error("box runs require an explicit model and provider");
+            }
             if (active.has(threadId))
                 throw new Error("a turn is already running on this thread");
             const turnId = newId();
-            const model = turn.model || MODELS.default;
+            const model = turn.model;
             const prompt = [
                 turn.system,
                 "You are working on your own cloud computer — its desktop, Chrome, and shell are yours.",
@@ -72,7 +65,7 @@ export const BoxAgentDriver = {
                 .join("\n");
             const started = await api(`/boxes/${boxId}/prompt`, {
                 method: "POST",
-                body: JSON.stringify({ provider: providerFor(model), model, prompt }),
+                body: JSON.stringify({ provider: turn.modelProvider, model, prompt }),
             });
             appendNative(threadId, { dir: "out", source: "box.prompt", msg: { model, prompt, response: started } });
             // real shape (2026-08): {type:"prompt.queued", promptId, promptRun:{id,…},
@@ -214,7 +207,7 @@ export const BoxAgentDriver = {
             driverKind: DRIVER_KIND,
             displayName: input.displayName,
             enabled: input.enabled,
-            models: MODELS,
+            catalog: async () => ({ default: { model: "" }, options: [] }),
             snapshot,
             adapter: {
                 provider: DRIVER_KIND,

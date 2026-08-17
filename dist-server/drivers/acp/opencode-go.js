@@ -5,14 +5,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createAcpDriver } from "./core.js";
 const CATALOG_URL = "https://opencode.ai/zen/go/v1/models";
-const STATIC_MODELS = {
-    default: "opencode-go/minimax-m3",
-    options: [
-        { id: "opencode-go/minimax-m3", label: "Minimax M3" },
-        { id: "opencode-go/kimi-k3", label: "Kimi K3" },
-        { id: "opencode-go/glm-5.2", label: "GLM 5.2" },
-    ],
-};
 let lastSuccessfulCatalog = null;
 function labelForModel(id) {
     return id
@@ -45,7 +37,7 @@ export async function fetchOpenCodeGoModels(fetcher = fetch) {
             if (!ids.length)
                 throw new Error("catalog contained no valid models");
             const catalog = {
-                default: `opencode-go/${ids[0]}`,
+                default: { model: `opencode-go/${ids[0]}` },
                 options: ids.map((id) => ({ id: `opencode-go/${id}`, label: labelForModel(id) })),
             };
             lastSuccessfulCatalog = catalog;
@@ -55,8 +47,10 @@ export async function fetchOpenCodeGoModels(fetcher = fetch) {
             clearTimeout(timeout);
         }
     }
-    catch {
-        return lastSuccessfulCatalog ?? STATIC_MODELS;
+    catch (error) {
+        if (lastSuccessfulCatalog)
+            return lastSuccessfulCatalog;
+        throw error;
     }
 }
 const stripForeignProviderKeys = (env) => {
@@ -105,7 +99,6 @@ function hasStoredOpenCodeGoAuth(env) {
 const support = (fetcher) => ({
     driverKind: "opencodeGo",
     displayName: "OpenCode Go",
-    models: STATIC_MODELS,
     defaultCli: "opencode",
     nativeSource: "opencode-go.acp",
     loginNote: "OpenCode Go is not configured — add an OPENCODE_API_KEY in OpenMausBot settings",

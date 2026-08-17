@@ -15,15 +15,6 @@ import { newEventId, newId } from "../contracts.js";
 import { augmentedPath } from "../env-path.js";
 import { appendNative } from "./native.js";
 const DRIVER_KIND = "codex";
-// catalog ported from upstream packages/contracts/src/model.ts
-const MODELS = {
-    default: "gpt-5.6-sol",
-    options: [
-        { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
-        { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
-        { id: "gpt-5.4", label: "GPT-5.4" },
-    ],
-};
 function decodeConfig(raw) {
     const o = (raw ?? {});
     return {
@@ -33,6 +24,153 @@ function decodeConfig(raw) {
 }
 const QUESTION_TIMEOUT_NOTE = "No answer was given — use your best judgment.";
 const DENY_TIMEOUT_NOTE = "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
+async function readCatalog(cli, environment) {
+    const env = {
+        ...process.env,
+        ...environment,
+        PATH: augmentedPath(),
+        NPM_CONFIG_LOGLEVEL: "error",
+    };
+    delete env.OPENAI_API_KEY;
+    const child = spawnCli(cli, ["app-server"], { env, stdio: ["pipe", "pipe", "pipe"] });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    let buffer = "";
+    let nextId = 1;
+    let stderr = "";
+    const pending = new Map();
+    const fail = (error) => {
+        for (const request of pending.values())
+            request.reject(error);
+        pending.clear();
+    };
+    child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+        if (stderr.length > 4096)
+            stderr = stderr.slice(-4096);
+    });
+    child.stdout.on("data", (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, newline);
+            buffer = buffer.slice(newline + 1);
+            if (!line.trim())
+                continue;
+            try {
+                const message = JSON.parse(line);
+                const request = pending.get(message.id);
+                if (!request)
+                    continue;
+                pending.delete(message.id);
+                if (message.error)
+                    request.reject(new Error(message.error.message ?? "Codex catalog request failed"));
+                else
+                    request.resolve(message.result);
+            }
+            catch {
+                // App-server logs must not make a valid later JSON-RPC response unreadable.
+            }
+        }
+    });
+    child.on("error", (error) => fail(error));
+    child.on("close", (code) => fail(new Error(`codex app-server exited ${code}${stderr ? `: ${stderr.trim()}` : ""}`)));
+    const request = (method, params, timeoutMs = 20_000) => new Promise((resolve, reject) => {
+        const id = nextId++;
+        const timer = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error(`codex ${method} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+        pending.set(id, {
+            resolve: (value) => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            reject: (error) => {
+                clearTimeout(timer);
+                reject(error);
+            },
+        });
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    });
+    try {
+        await request("initialize", { clientInfo: { name: "openmausbot", version: "1" } });
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} }) + "\n");
+        const listed = [];
+        let cursor = null;
+        do {
+            const page = await request("model/list", cursor ? { cursor } : {});
+            if (Array.isArray(page?.data))
+                listed.push(...page.data);
+            cursor = typeof page?.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
+        } while (cursor);
+        const configured = await request("config/read", { includeLayers: false });
+        const options = listed
+            .filter((model) => typeof model?.id === "string" && model.hidden !== true)
+            .map((model) => {
+            const additionalSpeedTiers = Array.isArray(model.additionalSpeedTiers)
+                ? model.additionalSpeedTiers.filter((id) => typeof id === "string")
+                : [];
+            const serviceTiers = Array.isArray(model.serviceTiers)
+                ? model.serviceTiers
+                    .filter((tier) => typeof tier?.id === "string")
+                    .map((tier) => ({ id: tier.id, label: typeof tier.name === "string" ? tier.name : tier.id }))
+                : [];
+            for (const id of additionalSpeedTiers) {
+                if (id === "fast") {
+                    // Codex reports the same speed mode under both IDs; keep the ID used by current config values.
+                    const priorityIndex = serviceTiers.findIndex((tier) => tier.id === "priority" && tier.label === "Fast");
+                    if (priorityIndex !== -1)
+                        serviceTiers.splice(priorityIndex, 1);
+                }
+                if (!serviceTiers.some((tier) => tier.id === id)) {
+                    serviceTiers.push({ id, label: id.charAt(0).toUpperCase() + id.slice(1) });
+                }
+            }
+            return {
+                id: model.id,
+                label: typeof model.displayName === "string" ? model.displayName : model.id,
+                efforts: Array.isArray(model.supportedReasoningEfforts)
+                    ? model.supportedReasoningEfforts
+                        .map((effort) => effort?.reasoningEffort)
+                        .filter((effort) => typeof effort === "string")
+                    : [],
+                ...(typeof model.defaultReasoningEffort === "string"
+                    ? { defaultEffort: model.defaultReasoningEffort }
+                    : {}),
+                serviceTiers,
+                defaultServiceTier: typeof model.defaultServiceTier === "string" ? model.defaultServiceTier : null,
+                provider: "codex",
+            };
+        });
+        if (!options.length)
+            throw new Error("codex model/list returned no visible models");
+        const config = configured?.config ?? {};
+        const reportedDefault = listed.find((model) => model?.isDefault === true)?.id;
+        const option = (typeof config.model === "string" ? options.find((candidate) => candidate.id === config.model) : undefined) ??
+            options.find((candidate) => candidate.id === reportedDefault) ??
+            options[0];
+        const defaultModel = option.id;
+        return {
+            default: {
+                model: defaultModel,
+                ...(typeof config.model_reasoning_effort === "string"
+                    ? { effort: config.model_reasoning_effort }
+                    : option.defaultEffort
+                        ? { effort: option.defaultEffort }
+                        : {}),
+                ...(config.service_tier !== undefined
+                    ? { serviceTier: typeof config.service_tier === "string" ? config.service_tier : null }
+                    : { serviceTier: option.defaultServiceTier ?? null }),
+            },
+            options,
+        };
+    }
+    finally {
+        killCliTree(child);
+    }
+}
 export const CodexDriver = {
     driverKind: DRIVER_KIND,
     metadata: { displayName: "Codex", supportsMultipleInstances: true },
@@ -46,7 +184,6 @@ export const CodexDriver = {
         docsUrl: "https://github.com/openai/codex",
         signInCommand: "codex",
     },
-    models: MODELS,
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
     async create(input) {
@@ -339,7 +476,11 @@ export const CodexDriver = {
                     let startedModel = null;
                     if (cursor) {
                         try {
-                            const resumed = await request("thread/resume", { threadId: cursor });
+                            const resumed = await request("thread/resume", {
+                                threadId: cursor,
+                                ...(turn.model ? { model: turn.model } : {}),
+                                ...(turn.serviceTier !== undefined ? { serviceTier: turn.serviceTier } : {}),
+                            });
                             codexThreadId = resumed?.thread?.id ?? cursor;
                         }
                         catch {
@@ -350,6 +491,7 @@ export const CodexDriver = {
                         const started = await request("thread/start", {
                             cwd: turn.cwd ?? homedir(),
                             model: turn.model || null,
+                            ...(turn.serviceTier !== undefined ? { serviceTier: turn.serviceTier } : {}),
                             sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
                             approvalPolicy: config.fullAuto ? "never" : "on-request",
                             ephemeral: false,
@@ -361,6 +503,7 @@ export const CodexDriver = {
                     await request("turn/start", {
                         threadId: codexThreadId,
                         input: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
+                        ...(turn.model ? { model: turn.model } : {}),
                         // Spread, not `effort: turn.effort ?? null`. Probed against
                         // codex-cli 0.146.0: null is indistinguishable from an absent key
                         // — both leave the thread's current effort alone, emitting no
@@ -371,6 +514,7 @@ export const CodexDriver = {
                         // sent another, and choosing Default lands on the bot's next new
                         // thread rather than the current one.
                         ...(turn.effort ? { effort: turn.effort } : {}),
+                        ...(turn.serviceTier !== undefined ? { serviceTier: turn.serviceTier } : {}),
                     });
                 }
                 catch (e) {
@@ -395,7 +539,7 @@ export const CodexDriver = {
             driverKind: DRIVER_KIND,
             displayName: input.displayName,
             enabled: input.enabled,
-            models: MODELS,
+            catalog: () => readCatalog(config.cli, input.environment),
             snapshot,
             adapter: {
                 provider: DRIVER_KIND,

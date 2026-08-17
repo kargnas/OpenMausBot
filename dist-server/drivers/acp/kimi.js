@@ -6,28 +6,23 @@
 // loadSession:true (session/load resume works), mcpCapabilities http+sse,
 // and a full session/new → session/prompt roundtrip streams
 // agent_thought_chunk + agent_message_chunk and settles with end_turn.
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isEffortLevel } from "../../contracts.js";
+import { execCli } from "../../procs.js";
 import { createAcpDriver } from "./core.js";
 function credentialsPath(env) {
     const dataRoot = env.KIMI_CODE_HOME || join(env.HOME || homedir(), ".kimi-code");
     return join(dataRoot, "credentials", "kimi-code.json");
 }
+function configPath(env) {
+    const dataRoot = env.KIMI_CODE_HOME || join(env.HOME || homedir(), ".kimi-code");
+    return join(dataRoot, "config.toml");
+}
 const support = {
     driverKind: "kimiAgent",
     displayName: "Kimi",
-    // Aliases from the CLI's own catalog (~/.kimi-code/config.toml
-    // [models."kimi-code/…"] — `kimi provider list` reports the same four).
-    models: {
-        default: "kimi-code/k3",
-        options: [
-            { id: "kimi-code/k3", label: "Kimi K3" },
-            { id: "kimi-code/k3-256k", label: "Kimi K3 256K" },
-            { id: "kimi-code/kimi-for-coding", label: "Kimi for Coding" },
-            { id: "kimi-code/kimi-for-coding-highspeed", label: "Kimi for Coding Highspeed" },
-        ],
-    },
     defaultCli: "kimi",
     nativeSource: "kimi.acp",
     loginNote: "Kimi Code CLI is not signed in — run `kimi login` in a terminal",
@@ -43,9 +38,18 @@ const support = {
         docsUrl: "https://moonshotai.github.io/kimi-code/en/guides/getting-started.html",
         signInCommand: "kimi login",
     },
-    // -m is a global commander option and must precede the `acp` subcommand
-    // (verified against 0.29.1).
-    spawnArgs: (_config, turn) => [...(turn.model ? ["-m", turn.model] : []), "acp"],
+    spawnArgs: () => ["acp"],
+    applySelection: async (request, sessionId, turn) => {
+        if (turn.model)
+            await request("session/set_model", { sessionId, modelId: turn.model });
+        if (turn.effort) {
+            await request("session/set_config_option", {
+                sessionId,
+                configId: "thinking",
+                value: turn.effort,
+            });
+        }
+    },
     // Subscription CLI: a leaked Moonshot/Kimi API key must not flip billing
     // to pay-as-you-go inside the spawned agent (mirrors claude/grok).
     transformEnv: (env) => {
@@ -60,6 +64,59 @@ const support = {
     // Match the child CLI's own data-root precedence. A custom instance HOME or
     // KIMI_CODE_HOME must not be checked against the server user's home instead.
     isAuthenticated: (env) => existsSync(credentialsPath(env)),
+    catalog: (config, env) => new Promise((resolve, reject) => {
+        execCli(config.cli, ["provider", "list", "--json"], { timeout: 20_000, env }, (error, stdout) => {
+            if (error)
+                return reject(error);
+            try {
+                const payload = JSON.parse(stdout);
+                const options = Object.entries(payload?.models ?? {}).map(([id, raw]) => {
+                    const model = raw;
+                    const capabilities = Array.isArray(model.capabilities) ? model.capabilities : [];
+                    const efforts = Array.isArray(model.supportEfforts)
+                        ? model.supportEfforts.filter((effort) => typeof effort === "string")
+                        : [];
+                    return {
+                        id,
+                        label: typeof model.displayName === "string" ? model.displayName : id,
+                        ...(efforts.length ? { efforts } : {}),
+                        ...(typeof model.defaultEffort === "string" ? { defaultEffort: model.defaultEffort } : {}),
+                        toolUse: capabilities.includes("tool_use"),
+                    };
+                });
+                if (!options.length)
+                    throw new Error("Kimi provider list returned no models");
+                let configured = "";
+                try {
+                    configured = readFileSync(configPath(env), "utf8");
+                }
+                catch {
+                    // Missing config means the CLI will use its catalog default.
+                }
+                const requestedModel = /^\s*default_model\s*=\s*"([^"]+)"/m.exec(configured)?.[1];
+                const model = requestedModel && options.some((option) => option.id === requestedModel)
+                    ? requestedModel
+                    : options[0].id;
+                const thinking = /\[thinking\]([\s\S]*?)(?:\n\[|$)/.exec(configured)?.[1] ?? "";
+                const configuredEffort = /^\s*effort\s*=\s*"([^"]+)"/m.exec(thinking)?.[1];
+                const selected = options.find((option) => option.id === model);
+                resolve({
+                    default: {
+                        model,
+                        ...(isEffortLevel(configuredEffort)
+                            ? { effort: configuredEffort }
+                            : isEffortLevel(selected.defaultEffort)
+                                ? { effort: selected.defaultEffort }
+                                : {}),
+                    },
+                    options,
+                });
+            }
+            catch (error) {
+                reject(error);
+            }
+        });
+    }),
     buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };
 export const KimiAgentDriver = createAcpDriver(support);

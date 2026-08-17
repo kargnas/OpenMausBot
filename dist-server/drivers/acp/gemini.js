@@ -26,13 +26,6 @@ const AUTH_PREFERENCE = ["gemini-api-key", "oauth-personal", "vertex-ai"];
 const support = {
     driverKind: "geminiAgent",
     displayName: "Gemini",
-    models: {
-        default: "gemini-2.5-pro",
-        options: [
-            { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-            { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-        ],
-    },
     defaultCli: "gemini",
     nativeSource: "gemini.acp",
     loginNote: "Gemini CLI is not signed in — run `gemini` once to log in, or set GEMINI_API_KEY",

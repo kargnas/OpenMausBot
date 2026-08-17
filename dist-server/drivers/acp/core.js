@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.js";
-import { newEventId, newId } from "../../contracts.js";
+import { isEffortLevel, newEventId, newId } from "../../contracts.js";
 import { computerProxyEnv } from "../../container-computer.js";
 import { augmentedPath } from "../../env-path.js";
 // the computer proxy entry: .ts in dev (node type stripping), .js in the
@@ -29,7 +29,7 @@ const COMPUTER_PROXY_PATH = (() => {
 })();
 import { appendNative } from "../native.js";
 const INIT_TIMEOUT = 20_000;
-const SESSION_CONFIG_TIMEOUT = 20_000; // configureSession's per-request default
+const SESSION_CONFIG_TIMEOUT = 20_000; // per-request default for session configuration
 const NEW_SESSION_TIMEOUT = 30_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
 const PROVIDER_CREDENTIAL_ENV = [
@@ -62,7 +62,6 @@ export function createAcpDriver(support) {
         driverKind: DRIVER_KIND,
         metadata: { displayName: support.displayName, supportsMultipleInstances: true },
         install: support.install,
-        models: support.models,
         decodeConfig,
         defaultConfig: () => decodeConfig({}),
         async create(input) {
@@ -81,20 +80,6 @@ export function createAcpDriver(support) {
                 support.transformEnv?.(env, config);
                 return env;
             };
-            let models = support.models;
-            const refreshModels = async () => {
-                if (!support.resolveModels)
-                    return;
-                try {
-                    const resolved = await support.resolveModels(childEnv());
-                    if (resolved.options.length)
-                        models = resolved;
-                }
-                catch {
-                    // Keep the last usable catalog when an optional discovery source is down.
-                }
-            };
-            await refreshModels();
             const listeners = new Set();
             const active = new Map();
             const emit = (event) => {
@@ -108,6 +93,109 @@ export function createAcpDriver(support) {
                 turnId,
                 createdAt: new Date().toISOString(),
             });
+            const catalog = async () => {
+                const env = childEnv();
+                if (support.catalog)
+                    return support.catalog(config, env);
+                if (support.resolveModels)
+                    return support.resolveModels(env);
+                // A failed probe must not veto turns: the catalog is advisory (the
+                // CLI makes the final call on a model id), so degrade to an empty
+                // catalog carrying the error instead of throwing.
+                return probeCatalog().catch((error) => ({
+                    default: { model: "" },
+                    options: [],
+                    error: error instanceof Error ? error.message : String(error),
+                }));
+            };
+            const probeCatalog = async () => {
+                const env = childEnv();
+                const probeTurn = { threadId: "catalog", text: "" };
+                const child = spawnCli(config.cli, support.spawnArgs(config, probeTurn), {
+                    cwd: config.workspace ?? homedir(),
+                    env,
+                    stdio: ["pipe", "pipe", "pipe"],
+                });
+                child.stdout.setEncoding("utf8");
+                child.stderr.setEncoding("utf8");
+                try {
+                    const initialized = await new Promise((resolve, reject) => {
+                        let buffer = "";
+                        let stderr = "";
+                        const timer = setTimeout(() => reject(new Error(`${support.displayName} catalog probe timed out`)), INIT_TIMEOUT);
+                        timer.unref?.();
+                        child.stderr.on("data", (chunk) => {
+                            stderr += chunk;
+                            if (stderr.length > 4096)
+                                stderr = stderr.slice(-4096);
+                        });
+                        child.on("error", reject);
+                        child.on("close", (code) => reject(new Error(`${support.displayName} catalog probe exited ${code}${stderr ? `: ${stderr.trim()}` : ""}`)));
+                        child.stdout.on("data", (chunk) => {
+                            buffer += chunk;
+                            let newline;
+                            while ((newline = buffer.indexOf("\n")) !== -1) {
+                                const line = buffer.slice(0, newline);
+                                buffer = buffer.slice(newline + 1);
+                                if (!line.trim())
+                                    continue;
+                                try {
+                                    const message = JSON.parse(line);
+                                    if (message.id !== 1)
+                                        continue;
+                                    clearTimeout(timer);
+                                    if (message.error)
+                                        reject(new Error(message.error.message ?? `${support.displayName} catalog probe failed`));
+                                    else
+                                        resolve(message.result);
+                                    return;
+                                }
+                                catch {
+                                    // Ignore non-protocol output and keep reading the JSON-RPC stream.
+                                }
+                            }
+                        });
+                        child.stdin.write(JSON.stringify({
+                            jsonrpc: "2.0",
+                            id: 1,
+                            method: "initialize",
+                            params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } },
+                        }) + "\n");
+                    });
+                    const state = initialized?._meta?.modelState;
+                    const options = (Array.isArray(state?.availableModels) ? state.availableModels : [])
+                        .filter((model) => typeof model?.modelId === "string")
+                        .map((model) => {
+                        const effortMeta = model?._meta ?? {};
+                        const efforts = Array.isArray(effortMeta.reasoningEfforts)
+                            ? effortMeta.reasoningEfforts
+                                .map((effort) => effort?.value ?? effort?.id)
+                                .filter((effort) => typeof effort === "string")
+                            : [];
+                        return {
+                            id: model.modelId,
+                            label: typeof model.name === "string" ? model.name : model.modelId,
+                            ...(efforts.length ? { efforts } : {}),
+                            ...(typeof effortMeta.reasoningEffort === "string"
+                                ? { defaultEffort: effortMeta.reasoningEffort }
+                                : {}),
+                        };
+                    });
+                    if (!options.length)
+                        throw new Error(`${support.displayName} initialize returned no model catalog`);
+                    const model = typeof state.currentModelId === "string" && options.some((option) => option.id === state.currentModelId)
+                        ? state.currentModelId
+                        : options[0].id;
+                    const selected = options.find((option) => option.id === model);
+                    return {
+                        default: { model, ...(isEffortLevel(selected.defaultEffort) ? { effort: selected.defaultEffort } : {}) },
+                        options,
+                    };
+                }
+                finally {
+                    killCliTree(child);
+                }
+            };
             // ACP session mcpServers: stdio is the baseline every ACP agent
             // supports (mcpCapabilities.http/.sse only add EXTRA transports), so
             // an injected stdio proxy — e.g. the peer-agent comms tool — attaches
@@ -457,14 +545,17 @@ export function createAcpDriver(support) {
                                     }
                                 }
                             }
+                            const configRequest = (method, params, timeoutMs) => request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT);
                             if (support.configureSession) {
                                 await support.configureSession({
-                                    request: (method, params, timeoutMs) => request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT),
+                                    request: configRequest,
                                     sessionId,
                                     config,
+                                    env,
                                     turn,
                                 });
                             }
+                            await support.applySelection?.(configRequest, sessionId, turn);
                         }
                         catch (error) {
                             // session.started is the only place the resume cursor is recorded,
@@ -537,10 +628,7 @@ export function createAcpDriver(support) {
                 driverKind: DRIVER_KIND,
                 displayName: input.displayName,
                 enabled: input.enabled,
-                get models() {
-                    return models;
-                },
-                refreshModels: support.resolveModels ? refreshModels : undefined,
+                catalog,
                 snapshot,
                 adapter: {
                     provider: DRIVER_KIND,

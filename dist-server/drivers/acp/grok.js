@@ -10,17 +10,6 @@ import { createAcpDriver } from "./core.js";
 const support = {
     driverKind: "grokAgent",
     displayName: "Grok",
-    // Mirrors `grok models` (CLI 1.0.3): 4.6 is the account default, 4.5 still
-    // selectable. Static because the catalog is account-driven and we have no
-    // session yet at describe() time; a new model the CLI adds needs a bump
-    // here — eventually read the initialize result's _meta.modelState instead.
-    models: {
-        default: "grok-4.6",
-        options: [
-            { id: "grok-4.6", label: "Grok 4.6" },
-            { id: "grok-4.5", label: "Grok 4.5" },
-        ],
-    },
     // Grok's accepted levels vary by model and the CLI validates lazily — a
     // rejected level only logs and falls back. Offer the intersection shared
     // by every model in this driver's picker; notably, grok-4.5 rejects xhigh.
