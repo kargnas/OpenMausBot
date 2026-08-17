@@ -67,7 +67,7 @@ function catalogFromHelp(help, env) {
     catch {
         settings = {};
     }
-    const custom = (settings.customModels ?? []).flatMap((m) => m.id ? [{ id: m.id, label: m.displayName || m.id }] : []);
+    const custom = (settings.customModels ?? []).flatMap((m) => m.id ? [{ id: m.id, label: m.displayName || m.id, custom: true }] : []);
     const discovered = listed.map(({ id, label }) => {
         const detail = details.get(label);
         return {

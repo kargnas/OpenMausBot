@@ -5,6 +5,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createAcpDriver } from "./core.js";
 const CATALOG_URL = "https://opencode.ai/zen/go/v1/models";
+const STATIC_MODELS = {
+    default: { model: "opencode-go/minimax-m3" },
+    options: [
+        { id: "opencode-go/minimax-m3", label: "Minimax M3" },
+        { id: "opencode-go/kimi-k3", label: "Kimi K3" },
+        { id: "opencode-go/glm-5.2", label: "GLM 5.2" },
+    ],
+};
 let lastSuccessfulCatalog = null;
 function labelForModel(id) {
     return id
@@ -36,10 +44,16 @@ export async function fetchOpenCodeGoModels(fetcher = fetch) {
                 .filter((id) => typeof id === "string" && /^[a-z0-9][a-z0-9._-]*$/i.test(id));
             if (!ids.length)
                 throw new Error("catalog contained no valid models");
-            const catalog = {
-                default: { model: `opencode-go/${ids[0]}` },
-                options: ids.map((id) => ({ id: `opencode-go/${id}`, label: labelForModel(id) })),
-            };
+            const options = STATIC_MODELS.options.map((option) => ({ ...option }));
+            const seen = new Set(options.map((option) => option.id));
+            for (const id of ids) {
+                const full = `opencode-go/${id}`;
+                if (seen.has(full))
+                    continue;
+                seen.add(full);
+                options.push({ id: full, label: labelForModel(id), custom: true });
+            }
+            const catalog = { default: STATIC_MODELS.default, options };
             lastSuccessfulCatalog = catalog;
             return catalog;
         }

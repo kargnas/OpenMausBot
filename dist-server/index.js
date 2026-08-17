@@ -13,7 +13,7 @@ import * as composio from "./composio.js";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.js";
 import { containerComputerAction, containerComputerMcp, containerComputerScreenshot, containerComputerStatus, setupCommands, } from "./container-computer.js";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, withInstanceCli, EVENTS_DIR, NATIVE_DIR } from "./config.js";
-import { augmentedPath, findCliCandidates, resetPathCache, splitCliString } from "./env-path.js";
+import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.js";
 import { describeSpawnFailure, execCli } from "./procs.js";
 import { buildNotification } from "./notify.js";
 import { isEffortLevel } from "./contracts.js";
@@ -1240,7 +1240,7 @@ async function testCliBinary(cli, driver) {
             // HTTP socket forever. maxBuffer bounds a chatty --version too.
             killSignal: "SIGKILL",
             maxBuffer: 1024 * 64,
-            env: { ...process.env, PATH: augmentedPath() },
+            env: cliProbeEnvironment(),
         }, (err, stdout) => {
             if (err) {
                 const e = err;
@@ -1248,18 +1248,38 @@ async function testCliBinary(cli, driver) {
                 // failures; for a non-zero exit it's the exit STATUS (a number) and
                 // for a timeout it's null + killed:true — describeSpawnFailure words
                 // only the first kind
-                const isSpawnError = typeof e.code === "string";
-                const message = isSpawnError
-                    ? describeSpawnFailure(e, cli).message
-                    : e.killed
-                        ? "CLI test timed out after 10s"
-                        : `CLI exited with error ${String(e.code)}: ${(stderrOf(err) || "").slice(0, 200) || err.message.split("\n")[0]}`;
+                const exceededBuffer = e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+                const isSpawnError = typeof e.code === "string" && !exceededBuffer;
+                const message = exceededBuffer
+                    ? "CLI test produced more than 64 KiB of output"
+                    : isSpawnError
+                        ? describeSpawnFailure(e, cli).message
+                        : e.killed
+                            ? "CLI test timed out after 10s"
+                            : `CLI exited with error ${String(e.code)}: ${(stderrOf(err) || "").slice(0, 200) || err.message.split("\n")[0]}`;
                 resolve({ ok: false, message, ...(driver?.install && isSpawnError ? { install: driver.install } : {}) });
                 return;
             }
             resolve({ ok: true, version: stdout.trim().split("\n")[0] });
         });
     });
+}
+/** A pre-save probe only needs PATH. Never hand credentials inherited by the
+ * desktop/server process to an arbitrary wrapper selected through Settings. */
+function cliProbeEnvironment() {
+    const env = { ...process.env, PATH: augmentedPath() };
+    for (const key of [
+        "XAI_API_KEY",
+        "BOX_TOKEN",
+        "OPENCODE_API_KEY",
+        "COMPOSIO_API_KEY",
+        "OMB_TTS_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+    ]) {
+        delete env[key];
+    }
+    return env;
 }
 /** execFile's error carries the child's stderr in .stderr. */
 function stderrOf(err) {
@@ -1292,6 +1312,12 @@ async function reloadProviders() {
     // async under the hood), stranding the bot busy — and its screen poller —
     // forever. Settle anything still marked busy.
     for (const b of store.bots.filter((b) => b.busy)) {
+        const vmLease = localVmLease.current(localVmOwnerBusy);
+        if (vmLease?.botId === b.id) {
+            localVmLease.release(vmLease.threadId);
+            if (localVmActiveThread === vmLease.threadId)
+                localVmActiveThread = null;
+        }
         stopScreenPoller(b.id);
         finalizeDelegationWatch(b.threadId, false, "", "Delegated turn did not finish — provider settings changed");
         const note = store.appendMessage(b.threadId, {
@@ -1304,6 +1330,10 @@ async function reloadProviders() {
         broadcast({ kind: "bot", bot: wireBot(store.bot(b.id)) });
     }
 }
+// Config writes rebuild the whole provider registry. Keep the read-modify-write
+// and reload sequence single-flight so two settings requests cannot drop one
+// another's changes or dispose a fleet while another reload is creating it.
+let providerConfigBusy = false;
 // ── HTTP plumbing ─────────────────────────────────────────────────────
 function json(res, status, body) {
     const data = JSON.stringify(body);
@@ -2324,11 +2354,10 @@ const server = createServer(async (req, res) => {
             if (!cli || /[\n\r]/.test(cli))
                 return json(res, 400, { error: "cli must be a non-empty path" });
             const driver = typeof body?.driver === "string" ? BUILT_IN_DRIVERS.find((d) => d.driverKind === body.driver) : undefined;
-            // probe ONLY the head token: `cli` may be a wrapper string with fixed
-            // args ("ag claude agp"), but letting the caller choose argv would
-            // make this route a one-line env exfil ("printenv XAI_API_KEY")
-            const head = splitCliString(cli)[0];
-            const probe = await testCliBinary(head || cli, driver);
+            // Probe the exact configured wrapper plus --version. testCliBinary uses
+            // a credential-redacted environment, so fixed wrapper arguments cannot
+            // turn this endpoint into an inherited-secret reader.
+            const probe = await testCliBinary(cli, driver);
             return json(res, 200, probe);
         }
         // ── per-instance CLI path override (custom builds / versioned bins) ──
@@ -2345,20 +2374,28 @@ const server = createServer(async (req, res) => {
                 return json(res, 400, { error: "cli must be a string" });
             if (/[\n\r]/.test(body.cli))
                 return json(res, 400, { error: "cli must not contain newlines" });
-            const result = withInstanceCli(cfg, instancePatch[1], body.cli);
-            if (!result.ok)
-                return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
-            // persist the whole instances map this rebuild produced — a fresh
-            // saveConfig({instances}) merge would re-derive defaults identically,
-            // but writing the resolved map keeps disk and runtime in lockstep
-            saveConfig({ instances: result.config.instances });
-            Object.assign(cfg, loadConfig());
-            await reloadProviders();
-            // rescan BEFORE describe(): the response's cliCandidates are computed
-            // from the memoized PATH, so resetting after would answer this request
-            // with the pre-reset cache
-            resetPathCache();
-            return json(res, 200, { instances: await registry.describe() });
+            if (providerConfigBusy)
+                return json(res, 409, { error: "provider settings are already being updated" });
+            providerConfigBusy = true;
+            try {
+                const result = withInstanceCli(cfg, instancePatch[1], body.cli);
+                if (!result.ok)
+                    return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
+                // persist the whole instances map this rebuild produced — a fresh
+                // saveConfig({instances}) merge would re-derive defaults identically,
+                // but writing the resolved map keeps disk and runtime in lockstep
+                saveConfig({ instances: result.config.instances });
+                Object.assign(cfg, loadConfig());
+                await reloadProviders();
+                // rescan BEFORE describe(): the response's cliCandidates are computed
+                // from the memoized PATH, so resetting after would answer this request
+                // with the pre-reset cache
+                resetPathCache();
+                return json(res, 200, { instances: await registry.describe() });
+            }
+            finally {
+                providerConfigBusy = false;
+            }
         }
         // ── app config (API keys — never echoed back, booleans only) ──
         if (method === "GET" && path === "/api/config") {
@@ -2396,66 +2433,74 @@ const server = createServer(async (req, res) => {
             }
             if (!Object.keys(patch).length)
                 return json(res, 400, { error: "nothing to save" });
-            // A project key is useful only if it can create/reuse the Session that
-            // powers both the connections UI and the agent MCP. Validate it before
-            // persisting, and save the non-secret ids needed to reuse that Session.
-            const requestedComposioKey = patch.composio?.apiKey;
-            if (typeof requestedComposioKey === "string") {
-                if (requestedComposioKey.trim()) {
-                    try {
-                        const prepared = await composio.prepareProjectSession(requestedComposioKey, cfg.composio);
-                        patch.composio = { ...(patch.composio ?? {}), ...prepared };
+            if (providerConfigBusy)
+                return json(res, 409, { error: "provider settings are already being updated" });
+            providerConfigBusy = true;
+            try {
+                // A project key is useful only if it can create/reuse the Session that
+                // powers both the connections UI and the agent MCP. Validate it before
+                // persisting, and save the non-secret ids needed to reuse that Session.
+                const requestedComposioKey = patch.composio?.apiKey;
+                if (typeof requestedComposioKey === "string") {
+                    if (requestedComposioKey.trim()) {
+                        try {
+                            const prepared = await composio.prepareProjectSession(requestedComposioKey, cfg.composio);
+                            patch.composio = { ...(patch.composio ?? {}), ...prepared };
+                        }
+                        catch (error) {
+                            return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+                        }
                     }
-                    catch (error) {
-                        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+                    else {
+                        patch.composio = { ...(patch.composio ?? {}), apiKey: "", sessionId: "" };
                     }
+                }
+                // check a box token against the provider before storing it: a
+                // rejected token used to save happily and only surface as a 401 in
+                // another panel later, with nothing the user could act on
+                const newBoxToken = patch.box?.token;
+                if (typeof newBoxToken === "string" && newBoxToken.trim()) {
+                    const check = await box.verifyToken(newBoxToken.trim());
+                    if (!check.ok)
+                        return json(res, 400, { error: check.message });
+                }
+                // same rule for a voice key — and check it against the provider the
+                // patch SELECTS, not the one already saved, or pasting a Cartesia key
+                // while switching from ElevenLabs validates against the wrong service
+                const newTts = patch.tts;
+                if (typeof newTts?.key === "string" && newTts.key.trim()) {
+                    const check = await tts.verifyKey(newTts.key.trim());
+                    if (!check.ok)
+                        return json(res, 400, { error: check.message });
+                }
+                const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
+                if (externalSecretStorage && patch.composio) {
+                    // Electron stores the project key with OS-backed encryption. Persist
+                    // only the non-secret Session ids here, while keeping the supplied
+                    // key live in this process until the next launch injects it by env.
+                    const composioPatch = patch.composio;
+                    const { apiKey: _secret, ...metadata } = composioPatch;
+                    saveConfig({ composio: { ...metadata, apiKey: "" } });
+                    cfg.composio = { ...cfg.composio, ...composioPatch };
+                    if (typeof composioPatch.apiKey === "string")
+                        process.env.COMPOSIO_API_KEY = composioPatch.apiKey;
                 }
                 else {
-                    patch.composio = { ...(patch.composio ?? {}), apiKey: "", sessionId: "" };
+                    saveConfig(patch);
+                    Object.assign(cfg, loadConfig());
                 }
+                // provider keys change the fleet; a profile or voice edit must not
+                // kill in-flight turns with a pointless reload — no driver reads
+                // either, and picking a voice mid-turn should be free
+                if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts"))
+                    await reloadProviders();
+                const status = configStatus();
+                broadcast({ kind: "config", ...status });
+                return json(res, 200, status);
             }
-            // check a box token against the provider before storing it: a
-            // rejected token used to save happily and only surface as a 401 in
-            // another panel later, with nothing the user could act on
-            const newBoxToken = patch.box?.token;
-            if (typeof newBoxToken === "string" && newBoxToken.trim()) {
-                const check = await box.verifyToken(newBoxToken.trim());
-                if (!check.ok)
-                    return json(res, 400, { error: check.message });
+            finally {
+                providerConfigBusy = false;
             }
-            // same rule for a voice key — and check it against the provider the
-            // patch SELECTS, not the one already saved, or pasting a Cartesia key
-            // while switching from ElevenLabs validates against the wrong service
-            const newTts = patch.tts;
-            if (typeof newTts?.key === "string" && newTts.key.trim()) {
-                const check = await tts.verifyKey(newTts.key.trim());
-                if (!check.ok)
-                    return json(res, 400, { error: check.message });
-            }
-            const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
-            if (externalSecretStorage && patch.composio) {
-                // Electron stores the project key with OS-backed encryption. Persist
-                // only the non-secret Session ids here, while keeping the supplied
-                // key live in this process until the next launch injects it by env.
-                const composioPatch = patch.composio;
-                const { apiKey: _secret, ...metadata } = composioPatch;
-                saveConfig({ composio: { ...metadata, apiKey: "" } });
-                cfg.composio = { ...cfg.composio, ...composioPatch };
-                if (typeof composioPatch.apiKey === "string")
-                    process.env.COMPOSIO_API_KEY = composioPatch.apiKey;
-            }
-            else {
-                saveConfig(patch);
-                Object.assign(cfg, loadConfig());
-            }
-            // provider keys change the fleet; a profile or voice edit must not
-            // kill in-flight turns with a pointless reload — no driver reads
-            // either, and picking a voice mid-turn should be free
-            if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts"))
-                await reloadProviders();
-            const status = configStatus();
-            broadcast({ kind: "config", ...status });
-            return json(res, 200, status);
         }
         // ── voice ─────────────────────────────────────────────────────────
         // Splitting text into utterances lives HERE, not in the renderer, for
