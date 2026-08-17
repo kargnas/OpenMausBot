@@ -97,6 +97,9 @@ export interface Task {
   threadId: string;
   title: string;
   createdAt: number;
+  /** folder this task's turns run in, pinned on its first turn; null =
+   * legacy home-folder session; absent = not pinned yet */
+  cwd?: string | null;
 }
 
 export interface Bot {
@@ -115,6 +118,8 @@ export interface Bot {
   modelSelection: ModelSelection;
   /** Where this bot's computer runs; unset = auto (cloud box if one exists, else local). */
   computer?: "cloud" | "vm" | "local" | "off";
+  /** where new tasks run their shell tools; absent = the private bot workspace */
+  cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
   /** tools this bot may always use without asking */
@@ -130,6 +135,9 @@ export interface Bot {
   /** When this bot wants to talk to another bot (ask_bot/delegate_bot),
    * pause and ask the user first. Off by default. */
   approvePeerComms?: boolean;
+  /** Whether this bot may use the workspace's connected apps. Unset means
+   * allowed for existing bots; imported bots start with this disabled. */
+  composio?: boolean;
   messages: Message[];
   /** leaf of the visible conversation branch (see visibleMessages) */
   activeLeafId?: string | null;
@@ -213,7 +221,11 @@ export interface InstanceInfo {
     }>;
     error?: string;
   };
-  capabilities?: { computerMcp?: boolean; agentsMcp?: boolean };
+  capabilities?: {
+    computerMcp?: boolean;
+    agentsMcp?: boolean;
+    composioMcp?: boolean;
+  };
   /** `custom` agents sit below the rail divider — no subscription catalog. */
   access?: "subscription" | "custom";
   install?: EngineInstall;
@@ -351,6 +363,7 @@ type Action =
           | "hidden"
           | "chiefOfStaff"
           | "approvePeerComms"
+          | "composio"
           | "modelSelection"
         >
       >;
