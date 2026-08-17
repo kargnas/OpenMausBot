@@ -213,9 +213,16 @@ export interface InstanceInfo {
   };
   capabilities?: { computerMcp?: boolean; agentsMcp?: boolean };
   install?: EngineInstall;
+  /** Configured CLI path override — set ONLY when the user overrode it;
+   * absent means the driver default is in effect. */
+  cli?: string;
+  /** Driver's default binary name (e.g. "claude"). */
+  cliDefault?: string;
+  /** Absolute paths of every default binary found on PATH, PATH order. */
+  cliCandidates?: string[];
 }
 
-export type AppSettingsSection = "general" | "connections" | "voice" | "computer";
+export type AppSettingsSection = "general" | "connections" | "engines" | "voice" | "computer";
 
 interface AppState {
   bots: Bot[];

@@ -20,8 +20,9 @@ import {
   setupCommands,
   type LifecycleAction,
 } from "./container-computer.ts";
-import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
-import { resetPathCache } from "./env-path.ts";
+import { ensureDirs, instanceConfigs, loadConfig, saveConfig, withInstanceCli, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
+import { augmentedPath, findCliCandidates, resetPathCache, splitCliString } from "./env-path.ts";
+import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import type { ModelSelection, RuntimeEvent } from "./contracts.ts";
 
@@ -1112,6 +1113,56 @@ function startGroupTurn(groupId: string, text: string) {
   groupQueues.set(groupId, next.catch(() => {}));
 }
 
+/** Pre-save probe for a CLI path override: run `<cli> --version` with the
+ * same environment a real turn gets (augmented PATH). Returns ok + the
+ * version line, or a fail the UI can act on — ENOENT on a GUI-launched app
+ * usually means "not on the app's PATH", the exact mistake this catches
+ * before the override is saved. */
+async function testCliBinary(
+  cli: string,
+  driver: (typeof BUILT_IN_DRIVERS)[number] | undefined,
+): Promise<{ ok: boolean; version?: string; message?: string; install?: (typeof BUILT_IN_DRIVERS)[number]["install"] }> {
+  return new Promise((resolve) => {
+    execCli(
+      cli,
+      ["--version"],
+      {
+        timeout: 10_000,
+        // SIGKILL, not SIGTERM: a child that traps TERM (sh -c "trap '' TERM;
+        // sleep 99999") would otherwise never fire the callback and pin the
+        // HTTP socket forever. maxBuffer bounds a chatty --version too.
+        killSignal: "SIGKILL",
+        maxBuffer: 1024 * 64,
+        env: { ...process.env, PATH: augmentedPath() },
+      },
+      (err, stdout) => {
+        if (err) {
+          const e = err as NodeJS.ErrnoException & { killed?: boolean };
+          // err.code is an errno CONSTANT ("ENOENT", "EACCES") only for spawn
+          // failures; for a non-zero exit it's the exit STATUS (a number) and
+          // for a timeout it's null + killed:true — describeSpawnFailure words
+          // only the first kind
+          const isSpawnError = typeof e.code === "string";
+          const message = isSpawnError
+            ? describeSpawnFailure(e, cli).message
+            : e.killed
+              ? "CLI test timed out after 10s"
+              : `CLI exited with error ${String(e.code)}: ${(stderrOf(err) || "").slice(0, 200) || err.message.split("\n")[0]}`;
+          resolve({ ok: false, message, ...(driver?.install && isSpawnError ? { install: driver.install } : {}) });
+          return;
+        }
+        resolve({ ok: true, version: stdout.trim().split("\n")[0] });
+      },
+    );
+  });
+}
+
+/** execFile's error carries the child's stderr in .stderr. */
+function stderrOf(err: unknown): string {
+  const s = (err as { stderr?: unknown }).stderr;
+  return typeof s === "string" ? s : Buffer.isBuffer(s) ? s.toString("utf8") : "";
+}
+
 function configStatus() {
   return {
     xai: { configured: Boolean(cfg.xai?.key) },
@@ -2079,6 +2130,67 @@ const server = createServer(async (req, res) => {
       // run?", and the interesting case is a CLI installed since launch.
       // Windows never pushes PATH changes into a live process, so without
       // this the answer is frozen at boot and "check again" is a no-op.
+      resetPathCache();
+      return json(res, 200, { instances: await registry.describe() });
+    }
+
+    // ── CLI binary discovery for the Engines "detected" dropdown ──
+    // ?name=claude → absolute paths of every `claude` on the augmented PATH,
+    // in PATH order (first = what a bare name runs). Polled when the user
+    // opens the Custom picker so a just-installed CLI appears without a restart.
+    if (method === "GET" && path === "/api/cli-candidates") {
+      const name = url.searchParams.get("name") ?? "";
+      resetPathCache();
+      return json(res, 200, { candidates: findCliCandidates(name) });
+    }
+
+    // ── pre-save CLI probe: does this path actually run? ──
+    // POST {cli, driver} → spawn `<cli> --version` with the same PATH the
+    // turn itself would use. A miss here (typo, missing exec bit, a binary
+    // the GUI app can't see) means every turn would fail, so the UI asks
+    // before saving rather than registering a dead engine.
+    if (method === "POST" && path === "/api/cli-test") {
+      // same gate as the local-VM lifecycle routes: this executes a local
+      // binary, so a hostile page must not be able to submit it as a simple
+      // text/plain cross-origin request
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const body = await readBody(req);
+      const cli = typeof body?.cli === "string" ? body.cli.trim() : "";
+      if (!cli || /[\n\r]/.test(cli)) return json(res, 400, { error: "cli must be a non-empty path" });
+      const driver = typeof body?.driver === "string" ? BUILT_IN_DRIVERS.find((d) => d.driverKind === body.driver) : undefined;
+      // probe ONLY the head token: `cli` may be a wrapper string with fixed
+      // args ("ag claude agp"), but letting the caller choose argv would
+      // make this route a one-line env exfil ("printenv XAI_API_KEY")
+      const head = splitCliString(cli)[0];
+      const probe = await testCliBinary(head || cli, driver);
+      return json(res, 200, probe);
+    }
+
+    // ── per-instance CLI path override (custom builds / versioned bins) ──
+    // PATCH /api/instances/:id {cli: "/path/to/cli" | ""} — "" reverts to the
+    // driver default. Kills in-flight turns like any provider reload.
+    const instancePatch = /^\/api\/instances\/([\w.-]+)$/.exec(path);
+    if (method === "PATCH" && instancePatch) {
+      // same non-simple-request gate as the local-VM lifecycle routes
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const body = await readBody(req);
+      if (typeof body?.cli !== "string") return json(res, 400, { error: "cli must be a string" });
+      if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
+      const result = withInstanceCli(cfg, instancePatch[1], body.cli);
+      if (!result.ok) return json(res, 404, { error: `unknown instance "${instancePatch[1]}"` });
+      // persist the whole instances map this rebuild produced — a fresh
+      // saveConfig({instances}) merge would re-derive defaults identically,
+      // but writing the resolved map keeps disk and runtime in lockstep
+      saveConfig({ instances: result.config.instances });
+      Object.assign(cfg, loadConfig());
+      await reloadProviders();
+      // rescan BEFORE describe(): the response's cliCandidates are computed
+      // from the memoized PATH, so resetting after would answer this request
+      // with the pre-reset cache
       resetPathCache();
       return json(res, 200, { instances: await registry.describe() });
     }
