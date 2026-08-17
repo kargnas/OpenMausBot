@@ -27,29 +27,33 @@ describe("OpenCode Go catalog", () => {
       }), { status: 200 }),
     );
 
-    expect(models).toEqual({
-      default: { model: "opencode-go/minimax-m3" },
-      options: [{ id: "opencode-go/minimax-m3", label: "Minimax M3" }],
-    });
+    expect(models.default.model).toBe("opencode-go/minimax-m3");
+    expect(models.options.filter((option) => !option.custom).map((option) => option.id)).toEqual([
+      "opencode-go/minimax-m3",
+      "opencode-go/kimi-k3",
+      "opencode-go/glm-5.2",
+    ]);
+    expect(models.options.some((option) => option.custom)).toBe(false);
   });
 
   it("uses the last successful catalog when the endpoint fails", async () => {
     const fetcher = async () =>
-      new Response(JSON.stringify([{ id: "kimi-k3" }]), { status: 200 });
+      new Response(JSON.stringify([{ id: "kimi-k3" }, { id: "extra-live" }]), { status: 200 });
     await fetchOpenCodeGoModels(fetcher);
 
     const fallback = await fetchOpenCodeGoModels(async () => {
       throw new Error("network down");
     });
 
-    expect(fallback.default.model).toBe("opencode-go/kimi-k3");
+    expect(fallback.default.model).toBe("opencode-go/minimax-m3");
+    expect(fallback.options.some((option) => option.id === "opencode-go/extra-live" && option.custom)).toBe(true);
   });
 
   it("resolves a fresh instance catalog on each request", async () => {
     let calls = 0;
     const driver = createOpenCodeGoDriver(async () => {
       calls += 1;
-      const id = calls === 1 ? "minimax-m3" : calls === 2 ? "kimi-k3" : "glm-5.2";
+      const id = calls === 1 ? "minimax-m3" : calls === 2 ? "extra-two" : "extra-three";
       return new Response(JSON.stringify([{ id }]), { status: 200 });
     });
     const instance = await driver.create({
@@ -60,9 +64,11 @@ describe("OpenCode Go catalog", () => {
       config: driver.defaultConfig(),
     });
 
-    expect((await instance.catalog()).default.model).toBe("opencode-go/minimax-m3");
-    expect((await instance.catalog()).default.model).toBe("opencode-go/kimi-k3");
-    expect((await instance.catalog()).default.model).toBe("opencode-go/glm-5.2");
+    const first = await instance.catalog();
+    expect(first.default.model).toBe("opencode-go/minimax-m3");
+    expect(first.options.some((option) => option.custom)).toBe(false);
+    expect((await instance.catalog()).options.some((option) => option.id === "opencode-go/extra-two" && option.custom)).toBe(true);
+    expect((await instance.catalog()).options.some((option) => option.id === "opencode-go/extra-three" && option.custom)).toBe(true);
     await instance.dispose();
   });
 

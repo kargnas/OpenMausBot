@@ -227,6 +227,8 @@ export interface ModelCatalog {
   options: Array<{
     id: string;
     label: string;
+    /** Local-host or ~/.codex-sourced row; the picker groups it under Custom. */
+    custom?: boolean;
     efforts?: string[];
     defaultEffort?: string;
     serviceTiers?: Array<{ id: string; label: string }>;

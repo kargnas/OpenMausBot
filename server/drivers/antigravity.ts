@@ -11,7 +11,8 @@
 // approves everything. Real per-action approval cards are a future path via
 // native ACP (agy issue #31), which would reuse acp/core.ts like grok/gemini.
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { DATA_DIR } from "../config.ts";
@@ -20,6 +21,7 @@ import { augmentedPath } from "../env-path.ts";
 import type { ChildProcess } from "node:child_process";
 import type {
   DriverCreateInput,
+  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -35,6 +37,63 @@ const DRIVER_KIND = "antigravityAgent";
 export interface AntigravityConfig {
   cli: string;
   fullAuto: boolean;
+}
+
+// model catalog from `agy models` (agy 1.1.12)
+export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
+  default: { model: "gemini-3.1-pro-high" },
+  options: [
+    { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)" },
+    { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)" },
+    { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)" },
+    { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)" },
+    { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)" },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" },
+    { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" },
+    { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)" },
+  ],
+};
+
+const AGY_MODEL_ID = /^[a-z0-9][a-z0-9._:/-]*$/i;
+
+function extrasFromUnknown(value: unknown): Array<{ id: string; label: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (typeof item === "string") return AGY_MODEL_ID.test(item) ? [{ id: item, label: item }] : [];
+    if (!item || typeof item !== "object") return [];
+    const row = item as { id?: unknown; model?: unknown; name?: unknown; displayName?: unknown };
+    const id = typeof row.id === "string" ? row.id : typeof row.model === "string" ? row.model : "";
+    if (!AGY_MODEL_ID.test(id)) return [];
+    const label = typeof row.name === "string" ? row.name : typeof row.displayName === "string" ? row.displayName : id;
+    return [{ id, label }];
+  });
+}
+
+/** Extra ids from ~/.gemini/antigravity-cli/settings.json, if the user added any. */
+export function readAntigravityModelCatalog(env: Record<string, string | undefined> = process.env) {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  let settings: Record<string, unknown> = {};
+  try {
+    settings = JSON.parse(
+      readFileSync(join(home, ".gemini", "antigravity-cli", "settings.json"), "utf8"),
+    ) as Record<string, unknown>;
+  } catch {
+    return STATIC_ANTIGRAVITY_MODELS;
+  }
+  const extras = [
+    ...extrasFromUnknown(settings.availableModels),
+    ...extrasFromUnknown(settings.customModels),
+    ...extrasFromUnknown(settings.extraModels),
+  ];
+  if (typeof settings.model === "string") extras.push(...extrasFromUnknown([settings.model]));
+  const options = STATIC_ANTIGRAVITY_MODELS.options.map((option) => ({ ...option }));
+  const seen = new Set(options.map((option) => option.id));
+  for (const extra of extras) {
+    if (seen.has(extra.id)) continue;
+    seen.add(extra.id);
+    options.push({ id: extra.id, label: extra.label, custom: true });
+  }
+  return { default: STATIC_ANTIGRAVITY_MODELS.default, options };
 }
 
 function decodeConfig(raw: unknown): AntigravityConfig {

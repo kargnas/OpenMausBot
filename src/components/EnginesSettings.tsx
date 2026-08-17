@@ -221,7 +221,9 @@ function EngineRow({ instance }: { instance: InstanceInfo }) {
       method: "PATCH",
       body: JSON.stringify({ cli: "" }),
     })
-      .then(() => refreshInstances())
+      // The reset already succeeded once PATCH returns 200. A follow-up list
+      // refresh failure should not tell the user the reset itself failed.
+      .then(() => Promise.resolve(refreshInstances()).catch(() => {}))
       .catch((e) => setError(e.message))
       .finally(() => setSwitching(false));
   };

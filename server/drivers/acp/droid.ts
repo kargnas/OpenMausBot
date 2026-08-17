@@ -86,7 +86,7 @@ function catalogFromHelp(help: string, env: Record<string, string | undefined>):
   }
 
   const custom: ModelCatalog["options"] = (settings.customModels ?? []).flatMap((m) =>
-    m.id ? [{ id: m.id, label: m.displayName || m.id }] : [],
+    m.id ? [{ id: m.id, label: m.displayName || m.id, custom: true }] : [],
   );
   const discovered: ModelCatalog["options"] = listed.map(({ id, label }) => {
     const detail = details.get(label);

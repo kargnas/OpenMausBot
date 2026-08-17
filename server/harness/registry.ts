@@ -46,14 +46,6 @@ function cliOfRaw(raw: unknown): string | undefined {
   return typeof cli === "string" && cli ? cli : undefined;
 }
 
-/** Every existing `<default>` binary on the augmented PATH — the Engines
- * dropdown's "detected" entries, in PATH order. Reuses findCliCandidates
- * so the endpoint and describe() agree on what "detected" means. */
-function cliCandidatesOf(driver: AnyProviderDriver | undefined): string[] {
-  const name = cliDefaultOf(driver);
-  return name ? findCliCandidates(name) : [];
-}
-
 export class ProviderRegistry {
   private byId = new Map<InstanceId, RegistryEntry>();
   /** decoded per-instance `cli` overrides, for describe() — drivers spawn
@@ -127,6 +119,18 @@ export class ProviderRegistry {
 
   /** instance snapshots for the model picker: id, driver, models, health */
   async describe() {
+    // Multiple instances may share a driver. Scan each default binary once
+    // per response instead of repeating filesystem work for every row.
+    const candidatesByName = new Map<string, string[]>();
+    const candidatesFor = (driver: AnyProviderDriver | undefined): string[] => {
+      const name = cliDefaultOf(driver);
+      if (!name) return [];
+      const cached = candidatesByName.get(name);
+      if (cached) return cached;
+      const found = findCliCandidates(name);
+      candidatesByName.set(name, found);
+      return found;
+    };
     return Promise.all(
       this.entries().map(async (entry) => {
         const driver = this.driversByKind.get(entry.shadow?.driverKind ?? entry.live!.driverKind);
@@ -144,7 +148,7 @@ export class ProviderRegistry {
             cliDefault: cliDefaultOf(driver),
             // a shadow is exactly the "your CLI is broken, pick another"
             // case where the detected-path dropdown matters most
-            cliCandidates: cliCandidatesOf(driver),
+            cliCandidates: candidatesFor(driver),
           };
         }
         const inst = entry.live;
@@ -181,7 +185,7 @@ export class ProviderRegistry {
           // every copy of the driver's default binary on the augmented PATH —
           // the dropdown's "detected" entries. Snapshotted per describe() so a
           // newly installed CLI shows up on the next refresh.
-          cliCandidates: cliCandidatesOf(driver),
+          cliCandidates: candidatesFor(driver),
         };
       }),
     );

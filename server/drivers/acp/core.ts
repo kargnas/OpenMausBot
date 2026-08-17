@@ -195,15 +195,27 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const catalog = async (): Promise<ModelCatalog> => {
         const env = childEnv();
         if (support.catalog) return support.catalog(config, env);
-        if (support.resolveModels) return support.resolveModels(env);
-        // A failed probe must not veto turns: the catalog is advisory (the
-        // CLI makes the final call on a model id), so degrade to an empty
-        // catalog carrying the error instead of throwing.
-        return probeCatalog().catch((error: unknown) => ({
-          default: { model: "" },
-          options: [],
-          error: error instanceof Error ? error.message : String(error),
-        }));
+        // Live initialize probe first (rich efforts + current model). When the
+        // CLI cannot answer, a support's resolveModels (file slugs, local-host
+        // injects) takes over; if neither serves, degrade to an empty catalog
+        // carrying the error — the catalog is advisory (the CLI makes the
+        // final call on a model id), so a failed lookup must not veto turns.
+        try {
+          return await probeCatalog();
+        } catch (probeError) {
+          if (support.resolveModels) {
+            try {
+              return await support.resolveModels(env);
+            } catch {
+              /* fall through to the degraded catalog */
+            }
+          }
+          return {
+            default: { model: "" },
+            options: [],
+            error: probeError instanceof Error ? probeError.message : String(probeError),
+          };
+        }
       };
 
       const probeCatalog = async (): Promise<ModelCatalog> => {

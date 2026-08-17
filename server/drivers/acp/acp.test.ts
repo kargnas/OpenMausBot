@@ -75,7 +75,9 @@ describe("ACP decodeConfig", () => {
     const support: AcpSupport = {
       driverKind: "dynamic-test",
       displayName: "Dynamic Test",
-      defaultCli: FAKE_CLI,
+      // a binary that cannot spawn: the initialize probe must fail so the
+      // support's resolveModels is what answers
+      defaultCli: "/nonexistent/dynamic-test-cli",
       nativeSource: "dynamic-test.acp",
       loginNote: "not authenticated",
       spawnArgs: () => [],
@@ -753,8 +755,8 @@ describe("ACP snapshot", () => {
       // favourites first in the user's own order, then the built-in slice
       const catalog = await instance.catalog();
       expect(catalog.options.slice(0, 2)).toEqual([
-        { id: "custom:Azure-Opus-0", label: "Azure Opus" },
-        { id: "custom:LMStudio-Qwen-0", label: "Qwen (local)" },
+        { id: "custom:Azure-Opus-0", label: "Azure Opus", custom: true },
+        { id: "custom:LMStudio-Qwen-0", label: "Qwen (local)", custom: true },
       ]);
       expect(catalog.options.some((o) => o.id === "claude-opus-5")).toBe(true);
       expect(catalog.default).toEqual({ model: "custom:LMStudio-Qwen-0", effort: "max" });
