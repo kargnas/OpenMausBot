@@ -212,6 +212,7 @@ export interface ModelCatalog {
   options: Array<{
     id: string;
     label: string;
+    custom?: boolean;
     efforts?: string[];
     defaultEffort?: string;
     serviceTiers?: Array<{ id: string; label: string }>;

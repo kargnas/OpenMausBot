@@ -24,8 +24,11 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { augmentedPath } from "../env-path.ts";
 import { appendNative } from "./native.ts";
+
+export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
 
@@ -205,6 +208,40 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
   async create(input: DriverCreateInput<CodexConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
+    const catalogEnv: Record<string, string | undefined> = { ...process.env, ...input.environment };
+    let models = STATIC_CODEX_MODELS;
+    const refreshModels = async () => {
+      // The app-server is the source of truth for ChatGPT-backed models and
+      // their capabilities (efforts, service tiers). The config-derived
+      // catalog additionally knows locally wired providers; merge its custom
+      // rows in so both live side by side. Either source failing alone must
+      // not leave the picker empty.
+      let live: ModelCatalog | null = null;
+      try {
+        live = await readCatalog(config.cli, input.environment);
+      } catch {
+        // Signed-out or missing CLI: fall through to the config catalog.
+      }
+      try {
+        const configured = await readCodexModelCatalog(catalogEnv);
+        if (configured.options.length) {
+          if (live) {
+            // The app-server's visible list is authoritative for official
+            // rows; from the config catalog keep only locally wired custom
+            // rows (custom providers the app-server cannot see).
+            const custom = configured.options.filter((option) => option.custom);
+            models = { default: live.default.model ? live.default : configured.default, options: [...live.options, ...custom] };
+          } else {
+            models = configured;
+          }
+        } else if (live) {
+          models = live;
+        }
+      } catch {
+        if (live) models = live;
+      }
+    };
+    await refreshModels();
     const listeners = new Set<RuntimeEventListener>();
     interface Turn {
       stop: () => void;
@@ -510,9 +547,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             }
           }
           if (!codexThreadId) {
+            const selection = decodeCodexSelection(turn.model);
             const started = await request("thread/start", {
               cwd: turn.cwd ?? homedir(),
-              model: turn.model || null,
+              model: selection.model,
+              ...(selection.modelProvider ? { modelProvider: selection.modelProvider } : {}),
               ...(turn.serviceTier !== undefined ? { serviceTier: turn.serviceTier } : {}),
               sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
               approvalPolicy: config.fullAuto ? "never" : "on-request",
@@ -564,7 +603,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      catalog: () => readCatalog(config.cli, input.environment),
+      catalog: async () => {
+        await refreshModels();
+        return models;
+      },
       snapshot,
       adapter: {
         provider: DRIVER_KIND,

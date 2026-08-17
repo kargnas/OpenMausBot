@@ -549,7 +549,8 @@ describe("comms e2e (fake ACP fleet)", () => {
       await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
       const helper = (await api("POST", "/api/bots")).body.bot;
       // a live engine whose CLI dies before the catalog probe answers —
-      // startTurn rejects, so B's turn never starts
+      // startTurn rejects, so B's turn never starts. The exit-early CLI
+      // kills the probe before initialize answers.
       const configured = await api("PATCH", `/api/bots/${helper.id}`, {
         name: "Helper",
         modelSelection: { instanceId: "helperNoCatalog", model: "fake-acp-model" },

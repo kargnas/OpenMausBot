@@ -189,7 +189,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const catalog = async (): Promise<ModelCatalog> => {
         const env = childEnv();
         if (support.catalog) return support.catalog(config, env);
-        if (support.resolveModels) return support.resolveModels(env);
+        // The CLI itself is the source of truth: initialize's _meta.modelState
+        // reflects this account's real models. resolveModels only supplies
+        // extras the CLI cannot report (config-file slugs) — probe first and
+        // fall back to resolveModels when the probe fails or reports nothing.
+        const probe = async (): Promise<ModelCatalog> => {
         const probeTurn: SendTurnInput = { threadId: "catalog", text: "" };
         const child = spawnCli(config.cli, support.spawnArgs(config, probeTurn), {
           cwd: config.workspace ?? homedir(),
@@ -265,12 +269,43 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               ? state.currentModelId
               : options[0].id;
           const selected = options.find((option) => option.id === model)!;
-          return {
+          const probed: ModelCatalog = {
             default: { model, ...(selected.defaultEffort ? { effort: selected.defaultEffort } : {}) },
             options,
           };
+          // A support's config-file extras ride along when the probe could not
+          // have seen them (custom provider slugs), tagged custom.
+          if (support.resolveModels) {
+            try {
+              const configured = await support.resolveModels(env);
+              // Only config-local rows (custom) can be extras: overlapping
+              // official rows would duplicate what the probe already listed.
+              const seen = new Set(probed.options.map((option) => option.id));
+              const extras = configured.options.filter((option) => option.custom && !seen.has(option.id));
+              if (extras.length) return { ...probed, options: [...probed.options, ...extras] };
+            } catch {
+              // resolveModels is a bonus source, never a hard dependency.
+            }
+          }
+          return probed;
         } finally {
           killCliTree(child);
+        }
+        };
+        try {
+          return await probe();
+        } catch (error) {
+          if (support.resolveModels) {
+            // The probe failed, so this catalog is a static/config fallback —
+            // carry the reason so callers can treat it as unverified rather
+            // than a live answer (PATCH skips model validation on it).
+            const fallback = await support.resolveModels(env);
+            return {
+              ...fallback,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+          throw error;
         }
       };
       // ACP session mcpServers: stdio is the baseline every ACP agent

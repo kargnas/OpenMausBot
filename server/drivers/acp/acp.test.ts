@@ -82,7 +82,7 @@ describe("ACP decodeConfig", () => {
       pickAuthMethod: () => null,
       authFailure: "continue",
       isAuthenticated: () => true,
-      resolveModels: async () => ({
+      catalog: async () => ({
         default: { model: "dynamic-model" },
         options: [{ id: "dynamic-model", label: "Dynamic model" }],
       }),
@@ -743,8 +743,8 @@ describe("ACP snapshot", () => {
       // favourites first in the user's own order, then the built-in slice
       const catalog = await instance.catalog();
       expect(catalog.options.slice(0, 2)).toEqual([
-        { id: "custom:Azure-Opus-0", label: "Azure Opus" },
-        { id: "custom:LMStudio-Qwen-0", label: "Qwen (local)" },
+        { id: "custom:Azure-Opus-0", label: "Azure Opus", custom: true },
+        { id: "custom:LMStudio-Qwen-0", label: "Qwen (local)", custom: true },
       ]);
       expect(catalog.options.some((o) => o.id === "claude-opus-5")).toBe(true);
       expect(catalog.default).toEqual({ model: "custom:LMStudio-Qwen-0", effort: "max" });
