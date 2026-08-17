@@ -60,9 +60,8 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
     };
   }, [open, pane]);
 
-  // Picking lands the catalog's own defaults for effort/tier alongside the
-  // model; rows with selectable capabilities keep the picker open so the
-  // controls below the current row are reachable.
+  // Effort/tier controls live in SettingsPanel's card next to the picker;
+  // a different model resets both because capabilities are per-model.
   const pick = (instance: InstanceInfo, option: InstanceInfo["models"]["options"][number]) => {
     dispatch({
       type: "setModel",
@@ -74,11 +73,7 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
         ...(option.serviceTiers?.length ? { serviceTier: option.defaultServiceTier ?? null } : {}),
       },
     });
-    if (!option.efforts?.length && !option.serviceTiers?.length) setOpen(false);
-  };
-
-  const updateOption = (patch: { effort?: string; serviceTier?: string | null }) => {
-    dispatch({ type: "setModel", botId: bot.id, selection: { ...selection, ...patch } });
+    setOpen(false);
   };
 
   return (
@@ -189,10 +184,10 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
                       !option.custom &&
                       (railInstance.snapshot.state !== "available" || needsSignIn(railInstance));
                     return (
-                      <div key={option.id}>
-                        <button
-                          disabled={disabled}
-                          onClick={() => pick(railInstance, option)}
+                      <button
+                        key={option.id}
+                        disabled={disabled}
+                        onClick={() => pick(railInstance, option)}
                           className={cn(
                             "flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-[13px]",
                             disabled ? "cursor-not-allowed text-ink-secondary/50" : "text-ink hover:bg-raised/60",
@@ -209,44 +204,6 @@ export function ModelPicker({ bot, className }: { bot: Bot; className?: string }
                           </span>
                           {current && <Check size={14} className="shrink-0 text-accent" />}
                         </button>
-                        {current && (option.efforts?.length || option.serviceTiers?.length) ? (
-                          <div className="grid grid-cols-2 gap-2 px-2 pb-2">
-                            {option.efforts?.length ? (
-                              <label className="text-[11px] text-ink-secondary">
-                                Effort
-                                <select
-                                  value={selection.effort ?? option.defaultEffort ?? ""}
-                                  onChange={(event) => updateOption({ effort: event.target.value })}
-                                  className="mt-1 w-full rounded-md border border-hairline/50 bg-inset px-2 py-1 text-[12px] text-ink"
-                                >
-                                  {option.efforts.map((effort) => (
-                                    <option key={effort} value={effort}>{effort}</option>
-                                  ))}
-                                </select>
-                              </label>
-                            ) : <span />}
-                            {option.serviceTiers?.length ? (
-                              <label className="text-[11px] text-ink-secondary">
-                                Processing
-                                <select
-                                  value={
-                                    selection.serviceTier === undefined
-                                      ? option.defaultServiceTier ?? ""
-                                      : selection.serviceTier ?? ""
-                                  }
-                                  onChange={(event) => updateOption({ serviceTier: event.target.value || null })}
-                                  className="mt-1 w-full rounded-md border border-hairline/50 bg-inset px-2 py-1 text-[12px] text-ink"
-                                >
-                                  <option value="">Standard</option>
-                                  {option.serviceTiers.map((tier) => (
-                                    <option key={tier.id} value={tier.id}>{tier.label}</option>
-                                  ))}
-                                </select>
-                              </label>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </div>
                     );
                   };
 
