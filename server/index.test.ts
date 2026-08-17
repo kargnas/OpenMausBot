@@ -76,7 +76,10 @@ beforeAll(async () => {
         config: { user_id: body.user_id },
       }));
     }
-    const ok = req.headers.authorization === "Bearer box_good";
+    if (req.headers.authorization === "Bearer box_slow") {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    const ok = req.headers.authorization === "Bearer box_good" || req.headers.authorization === "Bearer box_slow";
     res.writeHead(ok ? 200 : 401, { "content-type": "application/json" });
     res.end(JSON.stringify(ok ? { ok: true, boxes: [] } : { ok: false, code: "unauthorized" }));
   });
@@ -863,5 +866,36 @@ describe("instance CLI override API", () => {
     expect(res.body.ok).toBe(false);
     expect(res.body.message).toContain("isn't installed");
     expect(res.body.install?.docsUrl).toBe("https://claude.com/claude-code");
+  });
+
+  it("probes the complete wrapper with fixed arguments and no inherited credentials", async () => {
+    const script = join(home, "cli-wrapper-probe.mjs");
+    writeFileSync(
+      script,
+      `if (process.argv.slice(2).join(" ") !== "fixed --version") process.exit(9);\nif (process.env.COMPOSIO_API_KEY) process.exit(8);\nconsole.log("wrapper-ok");\n`,
+    );
+    const cli = `${JSON.stringify(process.execPath)} ${JSON.stringify(script)} fixed`;
+    const res = await api("POST", "/api/cli-test", { cli });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, version: "wrapper-ok" });
+  });
+
+  it("reports excessive probe output without presenting install guidance", async () => {
+    const script = join(home, "cli-noisy-probe.mjs");
+    writeFileSync(script, `process.stdout.write("x".repeat(70 * 1024));\n`);
+    const cli = `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`;
+    const res = await api("POST", "/api/cli-test", { cli, driver: "claudeAgent" });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.message).toContain("more than 64 KiB");
+    expect(res.body.install).toBeUndefined();
+  });
+
+  it("rejects overlapping provider configuration writes", async () => {
+    const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const overlapping = await api("PATCH", "/api/instances/ghost", { cli: "/tmp/ghost-overlap" });
+    expect(overlapping.status).toBe(409);
+    expect((await slowConfigWrite).status).toBe(200);
   });
 });

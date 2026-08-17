@@ -170,7 +170,7 @@ function CustomPicker({ instance, cliDefault, onClose, onSaved }: {
               Edit path
             </button>
             <button
-              onClick={persist}
+              onClick={() => persist()}
               disabled={busy}
               className="flex items-center gap-1.5 rounded-lg bg-raised px-3 py-1.5 text-[13px] text-danger hover:bg-raised-hover disabled:opacity-50"
             >
@@ -221,7 +221,9 @@ function EngineRow({ instance }: { instance: InstanceInfo }) {
       method: "PATCH",
       body: JSON.stringify({ cli: "" }),
     })
-      .then(() => refreshInstances())
+      // The reset already succeeded once PATCH returns 200. A follow-up list
+      // refresh failure should not tell the user the reset itself failed.
+      .then(() => Promise.resolve(refreshInstances()).catch(() => {}))
       .catch((e) => setError(e.message))
       .finally(() => setSwitching(false));
   };
@@ -296,4 +298,3 @@ export function EnginesSettings() {
     </div>
   );
 }
-
