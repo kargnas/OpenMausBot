@@ -50,6 +50,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "voice"
         | "chiefOfStaff"
         | "approvePeerComms"
+        | "modelSelection"
       >
     >,
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
@@ -274,6 +275,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </div>
             <ModelPicker bot={bot} />
           </div>
+
 
           <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Computer</div>

@@ -105,6 +105,8 @@ describe("ProviderRegistry", () => {
     expect(described.snapshot).toMatchObject({ state: "unavailable", reason: "provider probe exploded" });
   });
 
+
+
   it("disposeAll disposes every live instance and empties the registry", async () => {
     const fake = makeFakeDriver();
     const registry = new ProviderRegistry([fake.driver]);

@@ -5,7 +5,7 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | exit-early | hang | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | crash-on-prompt | hang | no-auth | auth-required | permission
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
 //                   | ask-peer (spawn the injected "agents" MCP server from
@@ -325,6 +325,12 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      if (mode === "crash-on-prompt") {
+        // initialize answered fine (the catalog probe passes); the crash
+        // lands mid-turn, after the harness already started the session
+        process.stderr.write("fake-acp: simulated crash mid-turn\n");
+        process.exit(3);
+      }
       if (mode === "hang") {
         // never resolve the prompt — lets tests exercise interrupt
         setInterval(() => {}, 1_000);
@@ -388,7 +394,7 @@ function handle(msg: any) {
           });
         return;
       }
-      playTurn();
+      if (mode !== "empty-reply") playTurn();
       if (mode === "permission") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;
