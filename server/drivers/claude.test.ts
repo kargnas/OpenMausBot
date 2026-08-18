@@ -269,8 +269,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       text: "hi",
       integrations: {
         composio: {
-          url: "https://app.composio.dev/tool_router/v3/trs_test/mcp",
-          headers: { "x-api-key": "ak_test" },
+          command: process.execPath,
+          args: ["/tmp/connector-proxy.js"],
+          env: { OMB_CONNECTOR_UPSTREAM_URL: "https://example.test/mcp" },
         },
       },
     });
@@ -278,9 +279,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
 
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.mcpConfig.mcpServers.composio).toMatchObject({
-      type: "http",
-      url: "https://app.composio.dev/tool_router/v3/trs_test/mcp",
-      headers: { "x-api-key": "ak_test" },
+      command: process.execPath,
+      args: ["/tmp/connector-proxy.js"],
+      env: { OMB_CONNECTOR_UPSTREAM_URL: "https://example.test/mcp" },
     });
     // the user's Composio key must not be readable via `ps`
     expect(JSON.stringify(seen.argv)).not.toContain("ak_test");
@@ -303,8 +304,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       text: "hi",
       integrations: {
         composio: {
-          url: "https://app.composio.dev/tool_router/v3/trs_test/mcp",
-          headers: { "x-api-key": "ak_test" },
+          command: process.execPath,
+          args: ["/tmp/connector-proxy.js"],
+          env: { OMB_CONNECTOR_UPSTREAM_URL: "https://example.test/mcp" },
         },
       },
     });
