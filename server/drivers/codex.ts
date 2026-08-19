@@ -11,7 +11,7 @@
 // and falls back to a fresh thread/start.
 import { homedir } from "node:os";
 
-import { describeSpawnFailure, execCli, execCliCombined, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -649,11 +649,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       });
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
       const authenticated = await new Promise<boolean>((resolve) => {
-        // codex-cli prints the status line to stderr on current versions
-        // and stdout on older ones — match against both, or every
-        // signed-in user reads as signed out.
-        execCliCombined(config.cli, ["login", "status"], { timeout: 8000, env }, (err, output) =>
-          resolve(!err && /logged in/i.test(output)),
+        execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
+          resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
         );
       });
       // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
