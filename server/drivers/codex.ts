@@ -11,11 +11,12 @@
 // and falls back to a fresh thread/start.
 import { homedir } from "node:os";
 
+import { computerProxyEnv } from "../container-computer.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
   DriverCreateInput,
-  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -50,145 +51,24 @@ const QUESTION_TIMEOUT_NOTE = "No answer was given — use your best judgment.";
 const DENY_TIMEOUT_NOTE =
   "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
 
-async function readCatalog(cli: string, environment: Record<string, string>): Promise<ModelCatalog> {
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    ...environment,
-    PATH: augmentedPath(),
-    NPM_CONFIG_LOGLEVEL: "error",
-  };
-  delete env.OPENAI_API_KEY;
-  const child = spawnCli(cli, ["app-server"], { env, stdio: ["pipe", "pipe", "pipe"] });
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  let buffer = "";
-  let nextId = 1;
-  let stderr = "";
-  const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
-  const fail = (error: Error) => {
-    for (const request of pending.values()) request.reject(error);
-    pending.clear();
-  };
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk;
-    if (stderr.length > 4096) stderr = stderr.slice(-4096);
-  });
-  child.stdout.on("data", (chunk) => {
-    buffer += chunk;
-    let newline;
-    while ((newline = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      if (!line.trim()) continue;
-      try {
-        const message = JSON.parse(line);
-        const request = pending.get(message.id);
-        if (!request) continue;
-        pending.delete(message.id);
-        if (message.error) request.reject(new Error(message.error.message ?? "Codex catalog request failed"));
-        else request.resolve(message.result);
-      } catch {
-        // App-server logs must not make a valid later JSON-RPC response unreadable.
-      }
-    }
-  });
-  child.on("error", (error) => fail(error));
-  child.on("close", (code) => fail(new Error(`codex app-server exited ${code}${stderr ? `: ${stderr.trim()}` : ""}`)));
+type StdioMcpServer = { command: string; args: string[]; env: Record<string, string> };
 
-  const request = (method: string, params: unknown, timeoutMs = 20_000) =>
-    new Promise<any>((resolve, reject) => {
-      const id = nextId++;
-      const timer = setTimeout(() => {
-        pending.delete(id);
-        reject(new Error(`codex ${method} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      timer.unref?.();
-      pending.set(id, {
-        resolve: (value) => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        reject: (error) => {
-          clearTimeout(timer);
-          reject(error);
-        },
-      });
-      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-    });
-
-  try {
-    await request("initialize", { clientInfo: { name: "openmausbot", version: "1" } });
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} }) + "\n");
-    const listed: any[] = [];
-    let cursor: string | null = null;
-    do {
-      const page = await request("model/list", cursor ? { cursor } : {});
-      if (Array.isArray(page?.data)) listed.push(...page.data);
-      cursor = typeof page?.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
-    } while (cursor);
-    const configured = await request("config/read", { includeLayers: false });
-    const options: ModelCatalog["options"] = listed
-      .filter((model: any) => typeof model?.id === "string" && model.hidden !== true)
-      .map((model: any) => {
-        const additionalSpeedTiers = Array.isArray(model.additionalSpeedTiers)
-          ? model.additionalSpeedTiers.filter((id: unknown): id is string => typeof id === "string")
-          : [];
-        const serviceTiers: Array<{ id: string; label: string }> = Array.isArray(model.serviceTiers)
-          ? model.serviceTiers
-              .filter((tier: any) => typeof tier?.id === "string")
-              .map((tier: any) => ({ id: tier.id, label: typeof tier.name === "string" ? tier.name : tier.id }))
-          : [];
-        for (const id of additionalSpeedTiers) {
-          if (id === "fast") {
-            // Codex reports the same speed mode under both IDs; keep the ID used by current config values.
-            const priorityIndex = serviceTiers.findIndex((tier) => tier.id === "priority" && tier.label === "Fast");
-            if (priorityIndex !== -1) serviceTiers.splice(priorityIndex, 1);
-          }
-          if (!serviceTiers.some((tier) => tier.id === id)) {
-            serviceTiers.push({ id, label: id.charAt(0).toUpperCase() + id.slice(1) });
-          }
-        }
-        return {
-          id: model.id,
-          label: typeof model.displayName === "string" ? model.displayName : model.id,
-          efforts: Array.isArray(model.supportedReasoningEfforts)
-            ? model.supportedReasoningEfforts
-                .map((effort: any) => effort?.reasoningEffort)
-                .filter((effort: unknown): effort is string => typeof effort === "string")
-            : [],
-          ...(typeof model.defaultReasoningEffort === "string"
-            ? { defaultEffort: model.defaultReasoningEffort }
-            : {}),
-          serviceTiers,
-          defaultServiceTier: typeof model.defaultServiceTier === "string" ? model.defaultServiceTier : null,
-          provider: "codex",
-        };
-      });
-    if (!options.length) throw new Error("codex model/list returned no visible models");
-    const config = configured?.config ?? {};
-    const reportedDefault = listed.find((model) => model?.isDefault === true)?.id;
-    const option =
-      (typeof config.model === "string" ? options.find((candidate) => candidate.id === config.model) : undefined) ??
-      options.find((candidate) => candidate.id === reportedDefault) ??
-      options[0];
-    const defaultModel = option.id;
-    return {
-      default: {
-        model: defaultModel,
-        ...(typeof config.model_reasoning_effort === "string"
-          ? { effort: config.model_reasoning_effort }
-          : option.defaultEffort
-            ? { effort: option.defaultEffort }
-            : {}),
-        ...(config.service_tier !== undefined
-          ? { serviceTier: typeof config.service_tier === "string" ? config.service_tier : null }
-          : { serviceTier: option.defaultServiceTier ?? null }),
-      },
-      options,
-    };
-  } finally {
-    killCliTree(child);
-  }
+function mountMcpServer(
+  appServerArgs: string[],
+  env: Record<string, string | undefined>,
+  name: string,
+  server: StdioMcpServer,
+): void {
+  Object.assign(env, server.env);
+  const prefix = `mcp_servers.${name}`;
+  appServerArgs.push(
+    "-c", `${prefix}.command=${JSON.stringify(server.command)}`,
+    "-c", `${prefix}.args=${JSON.stringify(server.args)}`,
+    // Values stay in the child environment; argv contains names only so
+    // credentials never appear in process listings or diagnostics.
+    "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
+    "-c", `${prefix}.default_tools_approval_mode="auto"`,
+  );
 }
 
 export const CodexDriver: ProviderDriver<CodexConfig> = {
@@ -224,34 +104,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     const catalogEnv = childEnv();
     let models = STATIC_CODEX_MODELS;
     const refreshModels = async () => {
-      // The app-server is the source of truth for ChatGPT-backed models and
-      // their capabilities (efforts, service tiers). The config-derived
-      // catalog additionally knows locally wired providers; merge its custom
-      // rows in so both live side by side. Either source failing alone must
-      // not leave the picker empty.
-      let live: ModelCatalog | null = null;
+      // readCodexModelCatalog asks the app-server first (the authoritative
+      // subscription catalog, including per-model capabilities) and merges
+      // locally wired provider rows from ~/.codex on top.
       try {
-        live = await readCatalog(config.cli, input.environment);
+        const resolved = await readCodexModelCatalog(catalogEnv, fetch, config.cli);
+        if (resolved.options.length) models = resolved;
       } catch {
-        // Signed-out or missing CLI: fall through to the config catalog.
-      }
-      try {
-        const configured = await readCodexModelCatalog(catalogEnv);
-        if (configured.options.length) {
-          if (live) {
-            // The app-server's visible list is authoritative for official
-            // rows; from the config catalog keep only locally wired custom
-            // rows (custom providers the app-server cannot see).
-            const custom = configured.options.filter((option) => option.custom);
-            models = { default: live.default.model ? live.default : configured.default, options: [...live.options, ...custom] };
-          } else {
-            models = configured;
-          }
-        } else if (live) {
-          models = live;
-        }
-      } catch {
-        if (live) models = live;
+        // Signed-out or missing CLI: keep the last usable catalog.
       }
     };
     await refreshModels();
@@ -282,15 +142,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const env = childEnv();
       const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
       if (turn.integrations?.composio) {
-        const bridge = turn.integrations.composio;
-        Object.assign(env, bridge.env);
-        const prefix = "mcp_servers.openmausbot_connectors";
-        appServerArgs.push(
-          "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
-          "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
-          "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
-          "-c", `${prefix}.default_tools_approval_mode="auto"`,
-        );
+        mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
+      }
+      if (turn.integrations?.computer) {
+        const proxyEnv = computerProxyEnv(turn.integrations.computer);
+        mountMcpServer(appServerArgs, env, "computer", {
+          command: process.execPath,
+          args: [SPAWNED_PROXIES.computer],
+          env: {
+            ELECTRON_RUN_AS_NODE: "1",
+            OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+            OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
+          },
+        });
+      } else if (turn.integrations?.localComputer) {
+        // The host daemon and isolated Local VM both arrive as a direct Cua
+        // Driver stdio MCP server. Codex sees the same computer tool surface.
+        mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
       }
       if (turn.integrations?.phone) {
         const bridge = turn.integrations.phone;
@@ -669,7 +537,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "unsupported", composioMcp: true, phoneMcp: true },
+        capabilities: {
+          sessionModelSwitch: "unsupported",
+          computerMcp: true,
+          composioMcp: true,
+          phoneMcp: true,
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),
         respondToRequest: async (threadId, requestId, decision) => {

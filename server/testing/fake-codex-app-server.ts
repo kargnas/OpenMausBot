@@ -84,16 +84,6 @@ process.stdin.on("data", (chunk) => {
       case "initialize":
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         break;
-      case "thread/resume":
-        if (mode === "resume") {
-          out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: msg.params?.threadId } } });
-        } else {
-          out({ jsonrpc: "2.0", id: msg.id, error: { code: -1, message: "no such thread" } });
-        }
-        break;
-      case "thread/start":
-        out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
-        break;
       case "model/list": {
         const secondPage = msg.params?.cursor === "page-2";
         out({
@@ -142,6 +132,17 @@ process.stdin.on("data", (chunk) => {
         });
         break;
       }
+      case "thread/resume":
+        if (mode === "resume") {
+          out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: msg.params?.threadId } } });
+        } else {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -1, message: "no such thread" } });
+        }
+        break;
+      case "thread/start":
+        out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
+        break;
+      
       case "config/read":
         out({
           jsonrpc: "2.0",
