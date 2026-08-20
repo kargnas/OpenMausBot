@@ -365,6 +365,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const sendTurn = async (turn: SendTurnInput) => {
         const { threadId } = turn;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+        const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
+        if (controlsHost && config.fullAuto) {
+          throw new Error("local computer control requires interactive provider approvals");
+        }
         const turnId = newId();
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
@@ -481,6 +485,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               requestId,
               behavior: optionId && behavior === "allow" ? "allow" : "deny",
               source: optionId ? source : "system",
+              approvalScope: controlsHost ? "local-computer" : undefined,
             });
           };
           const timer = setTimeout(() => {
@@ -496,6 +501,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             requestType: "permission",
             tool,
             summary,
+            approvalScope: controlsHost ? "local-computer" : undefined,
           });
         };
 
@@ -703,6 +709,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   env,
                   turn: cliTurn,
                 });
+                // initialize's currentModelId is the CLI default (grok-4.6),
+                // not the model this turn asked for. After a successful pin,
+                // report the slug we set so the UI does not claim otherwise.
+                if (!selectedModel && cliTurn.model) selectedModel = cliTurn.model;
               }
               await support.applySelection?.(configRequest, sessionId, turn);
             } catch (error) {
@@ -785,6 +795,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             agentsMcp: true,
             computerMcp: true,
             composioMcp: true,
+            localComputerMcp: !config.fullAuto,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),
