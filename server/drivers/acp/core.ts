@@ -57,8 +57,13 @@ export interface AcpSupport {
   access?: "subscription" | "custom";
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
-  /** Optional provider-specific live model catalog. */
-  resolveModels?(environment: Record<string, string | undefined>): ModelCatalog | Promise<ModelCatalog>;
+  /** Optional live model catalog. A failed lookup keeps the last usable catalog.
+   *  `config` is the instance decode so a support can ask the same binary it
+   *  will spawn (custom `cli` paths), not whatever happens to be named on PATH. */
+  resolveModels?(
+    environment: Record<string, string | undefined>,
+    config: AcpConfig,
+  ): ModelCatalog | Promise<ModelCatalog>;
   /** Native-protocol log label, e.g. "grok.acp". */
   nativeSource: string;
   /** Whether models behind this ACP harness can consume a referenced image.
@@ -134,6 +139,8 @@ const PROVIDER_CREDENTIAL_ENV = [
   "OPENAI_API_KEY",
   "OPENCODE_API_KEY",
   "XAI_API_KEY",
+  "CURSOR_API_KEY",
+  "CURSOR_AUTH_TOKEN",
 ] as const;
 
 function decodeAcpConfig(defaultCli: string) {
@@ -296,7 +303,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // have seen them (custom provider slugs), tagged custom.
           if (support.resolveModels) {
             try {
-              const configured = await support.resolveModels(env);
+              const configured = await support.resolveModels(env, config);
               // Only config-local rows (custom) can be extras: overlapping
               // official rows would duplicate what the probe already listed.
               const seen = new Set(probed.options.map((option) => option.id));
@@ -318,7 +325,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // The probe failed, so this catalog is a static/config fallback —
             // carry the reason so callers can treat it as unverified rather
             // than a live answer (PATCH skips model validation on it).
-            const fallback = await support.resolveModels(env);
+            const fallback = await support.resolveModels(env, config);
             return {
               ...fallback,
               error: error instanceof Error ? error.message : String(error),
