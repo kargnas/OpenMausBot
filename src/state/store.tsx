@@ -105,6 +105,8 @@ export interface Group {
   /** folder the room's turns actually run in, pinned on the first turn;
    * null = each member's own default; absent = not pinned yet */
   pinnedCwd?: string | null;
+  /** the one message pinned to the top of this room's transcript */
+  pinnedMessageId?: string;
   messages: Message[];
 }
 
@@ -169,6 +171,8 @@ export interface Bot {
   voice?: string;
   pinned?: boolean;
   hidden?: boolean;
+  /** the one message pinned to the top of this bot's active thread */
+  pinnedMessageId?: string;
   /** The workspace's one primary coordinator. */
   chiefOfStaff?: boolean;
   /** When this bot wants to talk to another bot (ask_bot/delegate_bot),
@@ -215,6 +219,7 @@ export interface ConfigStatus {
   composio: { configured: boolean; mode?: "managed" | "self-hosted" | "unavailable" };
   box: { configured: boolean };
   vps: { configured: boolean; sshAlias: string };
+  rooms: { turnTimeoutMinutes: number };
   opencodeGo?: { configured: boolean };
   /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
@@ -222,6 +227,24 @@ export interface ConfigStatus {
   tts?: { configured: boolean; ready: boolean; voice: string };
   /** who's using the app — collected in onboarding, shown in the sidebar */
   profile?: { name: string; email: string };
+}
+
+export type ConfigStatusFrame = Pick<
+  ConfigStatus,
+  "xai" | "composio" | "box" | "vps" | "rooms" | "opencodeGo" | "tts" | "profile"
+>;
+
+export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
+  return {
+    xai: frame.xai,
+    composio: frame.composio,
+    box: frame.box,
+    vps: frame.vps,
+    rooms: frame.rooms,
+    opencodeGo: frame.opencodeGo,
+    tts: frame.tts,
+    profile: frame.profile,
+  };
 }
 
 /** How an engine gets installed — declared by its driver, mirrors
@@ -361,7 +384,7 @@ export type Action =
   | {
       type: "patchGroup";
       groupId: string;
-      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder">>;
+      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId">>;
     }
   | { type: "deleteGroup"; groupId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
@@ -432,6 +455,7 @@ export type Action =
           | "voice"
           | "pinned"
           | "hidden"
+          | "pinnedMessageId"
           | "chiefOfStaff"
           | "approvePeerComms"
           | "composio"
@@ -1469,14 +1493,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "config":
           rawDispatch({
             type: "configStatus",
-            config: {
-              xai: frame.xai,
-              composio: frame.composio,
-              box: frame.box,
-              vps: frame.vps,
-              tts: frame.tts,
-              profile: frame.profile,
-            },
+            config: configStatusFromFrame(frame),
           });
           api("/api/instances")
             .then(({ instances }) => rawDispatch({ type: "instances", instances }))

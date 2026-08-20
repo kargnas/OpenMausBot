@@ -13,6 +13,7 @@ import { approvalKey, autoVerdict } from "./auto-approve.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
+import { RoomTurnStallRegistry, roomTurnTimeoutMessage, scheduleRoomTurnTimeout } from "./room-turn-timeout.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -30,6 +31,7 @@ import {
   instanceConfigs,
   loadConfig,
   parseConfigPatch,
+  roomTurnTimeoutMinutes,
   saveConfig,
   syncCredentialEnv,
   withInstanceCli,
@@ -51,7 +53,7 @@ import { _loadPending, discardDelegations, drainDelegations, pendingThreads, que
 import { drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
-import { cancelPeerApprovalsFor, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
+import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import { modelSupportsTools, selectedModel } from "./models.ts";
 import {
   mentionedBots,
@@ -487,6 +489,22 @@ async function answerRequest(
   return outcome;
 }
 
+/** Close every approval still open on a thread. Interrupting a turn kills the
+ * process that raised its questions, so those cards can never be answered —
+ * and a pending approval owns the composer, so one left open blocks the
+ * conversation behind a question with nobody left to hear the answer. */
+function closeOpenApprovals(threadId: string): void {
+  // Peer approvals also hold an in-memory promise. Resolve those first; merely
+  // patching their cards would leave the delegation queue waiting 15 minutes.
+  cancelPeerApprovalsForThread(threadId);
+  for (const message of store.messagesFor(threadId)) {
+    const card = message.card;
+    if (!card?.requestId || card.answered || card.dismissed) continue;
+    store.patchMessage(threadId, message.id, { card: { ...card, answered: "unavailable", dismissed: true } });
+    askMessageByRequest.delete(`${threadId}:${card.requestId}`);
+  }
+}
+
 function requestBehavior(value: unknown): "allow" | "deny" | "answer" | null {
   return value === "allow" || value === "deny" || value === "answer" ? value : null;
 }
@@ -517,12 +535,13 @@ const turnUsage = new Map<string, { input: number; output: number }>();
 const repeats = new RepeatDetector({ thresholds: [5, 10, 20], maxKeysPerThread: 256 });
 
 // ── stall watchdog ─────────────────────────────────────────────────────
-// ask_bot has a 4-minute ceiling and room turns a 5-minute one; the main
-// 1:1 path had none, so a wedged CLI left its bot busy forever. The
-// watchdog stops a turn whose thread has emitted NOTHING for stallMs —
+// ask_bot has a 4-minute ceiling, while room turns have a separately
+// configurable absolute ceiling. The main 1:1 path had none, so a wedged CLI
+// left its bot busy forever. The watchdog stops a turn whose thread has emitted NOTHING for stallMs —
 // activity-based, so an hour-long turn that keeps streaming is never
 // touched, and turns parked on a human approval are exempt.
 const TURN_STALL_MS = Math.max(60_000, Number(process.env.OMB_TURN_STALL_MS) || 20 * 60_000);
+const roomStallCompletions = new RoomTurnStallRegistry();
 const watchdog = new TurnWatchdog({
   stallMs: TURN_STALL_MS,
   checkMs: 60_000,
@@ -539,6 +558,7 @@ const watchdog = new TurnWatchdog({
     });
     finalizeDelegationWatch(turn.threadId, false, "", "Delegated turn stalled and was stopped");
     turnUsage.delete(turn.threadId);
+    roomStallCompletions.stall(turn.threadId);
     // ACP interruption settles within five seconds; other adapters settle
     // sooner. Keep ownership during that grace period so another turn cannot
     // overlap the process we are stopping. The normal turn.completed fold
@@ -1850,30 +1870,36 @@ async function runGroupMemberTurn(
   // run the turn and wait for it to settle, folding the reply text so a
   // chained @mention can be routed afterwards
   let replyText = "";
-  const outcome = await new Promise<"settled" | "dispatch_failed" | "timed_out">((resolve) => {
+  const timeoutMinutes = roomTurnTimeoutMinutes(cfg);
+  const outcome = await new Promise<"settled" | "dispatch_failed" | "stalled" | "timed_out">((resolve) => {
     let done = false;
-    const finish = (value: "settled" | "dispatch_failed" | "timed_out") => {
+    let timer!: ReturnType<typeof setTimeout>;
+    let unsub = () => {};
+    let unregisterStall = () => {};
+    const finish = (value: "settled" | "dispatch_failed" | "stalled" | "timed_out") => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       unsub();
+      unregisterStall();
       resolve(value);
     };
-    const unsub = bus.subscribe((e: RuntimeEvent) => {
+    unsub = bus.subscribe((e: RuntimeEvent) => {
       if (e.threadId !== group.threadId) return;
       if (e.type === "item.completed" && e.itemType === "assistant_text") replyText += `\n${e.text}`;
       else if (e.type === "turn.completed") finish("settled");
     });
-    const timer = setTimeout(() => {
+    timer = scheduleRoomTurnTimeout(timeoutMinutes, () => {
       void instance.adapter.interruptTurn(group.threadId).catch(() => {});
       store.appendMessage(group.threadId, {
         role: "bot",
         kind: "activity",
         from: { botId: bot.id, name: bot.name, color: bot.color },
-        tool: { name: `${bot.name}'s room turn exceeded 5 minutes and was stopped`, ok: false },
+        tool: { name: roomTurnTimeoutMessage(bot.name, timeoutMinutes), ok: false },
       });
       finish("timed_out");
-    }, 5 * 60_000);
+    });
+    unregisterStall = roomStallCompletions.register(group.threadId, () => finish("stalled"));
     watchdog.watch(group.threadId, bot.id);
     instance.adapter
       .sendTurn({
@@ -1899,7 +1925,7 @@ async function runGroupMemberTurn(
   // A timed-out provider still owns the room thread until its interrupt
   // produces turn.completed (or the stall watchdog's grace fallback runs).
   // Do not clear busy or start the next member on that same thread early.
-  if (outcome === "timed_out") return false;
+  if (outcome === "stalled" || outcome === "timed_out") return false;
   // turn.completed normally performs this cleanup. Only use the fallback
   // when this invocation still owns the room; otherwise it would emit a
   // duplicate group frame or clear a newer speaker's state.
@@ -2145,6 +2171,7 @@ function configStatus() {
     tts: tts.describeVoice(cfg),
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    rooms: { turnTimeoutMinutes: roomTurnTimeoutMinutes(cfg) },
   };
 }
 
@@ -2947,6 +2974,15 @@ const server = createServer(async (req, res) => {
         if (!checked.ok) return json(res, 400, { error: checked.error });
         patch.cwd = checked.cwd ?? undefined;
       }
+      // one pinned message per room; null/"" clears. The id is not
+      // validated against the transcript here — a pin whose message was
+      // edited away or deleted simply resolves to nothing in the UI.
+      if (body.pinnedMessageId !== undefined) {
+        if (body.pinnedMessageId === null || body.pinnedMessageId === "") patch.pinnedMessageId = undefined;
+        else if (typeof body.pinnedMessageId === "string" && /^[\w-]+$/.test(body.pinnedMessageId)) {
+          patch.pinnedMessageId = body.pinnedMessageId;
+        } else return json(res, 400, { error: "pinnedMessageId must be a message id" });
+      }
       const group = store.patchGroup(m[1], patch);
       if (!group) return json(res, 404, { error: "no such room" });
       return json(res, 200, { group });
@@ -2986,6 +3022,7 @@ const server = createServer(async (req, res) => {
       const busy = group.busyBotId ? store.bot(group.busyBotId) : undefined;
       const instance = busy ? registry.get(busy.modelSelection.instanceId) : undefined;
       await instance?.adapter.interruptTurn(group.threadId).catch(() => {});
+      closeOpenApprovals(group.threadId);
       return json(res, 200, { ok: true });
     }
 
@@ -3073,8 +3110,11 @@ const server = createServer(async (req, res) => {
         ) {
           return json(res, 400, { error: "invalid model selection" });
         }
-        const selectedInstance = registry.get(raw.instanceId);
-        if (!selectedInstance) return json(res, 409, { error: `provider instance "${raw.instanceId}" is unavailable` });
+        // An offline/unknown instance is persistable: users pre-configure
+        // engines before first use, and duplicateBot re-sends a whole
+        // selection next to persona fields. startTurn is the loud gate —
+        // it refuses to run a turn on an instance that cannot answer.
+        const selectedInstance = registry.get(raw.instanceId) ?? null;
         const selection: ModelSelection = {
           instanceId: raw.instanceId,
           model: raw.model,
@@ -3086,9 +3126,9 @@ const server = createServer(async (req, res) => {
         // duplicateBot its name/title/description too — startTurn refuses to
         // run on an unavailable instance anyway, so an unverifiable value
         // never reaches a CLI.
-        let catalog;
+        let catalog = null;
         try {
-          catalog = await selectedInstance.catalog();
+          if (selectedInstance) catalog = await selectedInstance.catalog();
         } catch {
           catalog = null;
         }
@@ -3105,6 +3145,15 @@ const server = createServer(async (req, res) => {
         patch.modelSelection = selection;
       }
 
+      // one pinned message per thread; null/"" clears. The id is not
+      // validated against the transcript here — a pin whose message was
+      // edited to another branch or deleted simply resolves to nothing.
+      if (body.pinnedMessageId !== undefined) {
+        if (body.pinnedMessageId === null || body.pinnedMessageId === "") patch.pinnedMessageId = undefined;
+        else if (typeof body.pinnedMessageId === "string" && /^[\w-]+$/.test(body.pinnedMessageId)) {
+          patch.pinnedMessageId = body.pinnedMessageId;
+        } else return json(res, 400, { error: "pinnedMessageId must be a message id" });
+      }
       // per-bot gate on the workspace's connected apps (Composio)
       if (body.composio !== undefined) {
         if (typeof body.composio !== "boolean") return json(res, 400, { error: "composio must be true or false" });
@@ -3403,8 +3452,12 @@ const server = createServer(async (req, res) => {
       // a bot busy in a ROOM is running on the room's thread — stopping it
       // from its own chat must reach that turn, not just the 1:1 thread
       const busyGroup = store.groups.find((g) => g.busyBotId === bot.id);
-      if (busyGroup) await instance?.adapter.interruptTurn(busyGroup.threadId).catch(() => {});
-      await instance?.adapter.interruptTurn(bot.threadId);
+      if (busyGroup) {
+        await instance?.adapter.interruptTurn(busyGroup.threadId).catch(() => {});
+        closeOpenApprovals(busyGroup.threadId);
+      }
+      await instance?.adapter.interruptTurn(bot.threadId).catch(() => {});
+      closeOpenApprovals(bot.threadId);
       return json(res, 200, { ok: true });
     }
 
@@ -3689,12 +3742,13 @@ const server = createServer(async (req, res) => {
         syncCredentialEnv(patch);
         Object.assign(cfg, loadConfig());
       }
-      // provider keys change the fleet; a profile or voice edit must not
-      // kill in-flight turns with a pointless reload — no driver reads
-      // either, and picking a voice mid-turn should be free
-      // The VPS alias is consumed by lifecycle commands, not provider
-      // engines. Saving it must not interrupt an in-flight turn.
-      if (Object.keys(patch).some((k) => k !== "profile" && k !== "tts" && k !== "vps")) await reloadProviders();
+      // Provider keys change the fleet. Profile, voice, VPS, and room timeout
+      // changes do not rebuild it: no driver reads them, and they should not
+      // interrupt in-flight turns.
+      const reloadKeys = Object.keys(patch).filter(
+        (key) => key !== "profile" && key !== "tts" && key !== "vps" && key !== "rooms",
+      );
+      if (reloadKeys.length > 0) await reloadProviders();
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);

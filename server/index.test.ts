@@ -5,7 +5,7 @@
 // the shadow-instance behavior end to end while it's at it.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, request, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,7 @@ import { openSse } from "./testing/sse.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
+const FAKE_CLAUDE_CLI = join(SERVER_DIR, "testing", "fake-claude-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
@@ -27,6 +28,7 @@ let boxStub: Server;
 let boxStubPort = 0;
 let home: string;
 let staticDir: string;
+let fakeClaudeDump: string;
 let stderr = "";
 
 const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
@@ -51,6 +53,7 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-api-test-"));
   staticDir = join(home, "static");
+  fakeClaudeDump = join(home, "fake-claude-dump.json");
   // a fleet of exactly one unknown driver: no CLI probes, no network
   mkdirSync(join(home, ".openmausbot"), { recursive: true });
   mkdirSync(join(staticDir, "assets"), { recursive: true });
@@ -58,7 +61,12 @@ beforeAll(async () => {
   writeFileSync(join(staticDir, "assets", "smoke.css"), "body { color: white; }");
   writeFileSync(
     join(home, ".openmausbot", "config.json"),
-    JSON.stringify({ instances: { ghost: { driver: "not-a-real-driver", displayName: "Ghost" } } }),
+    JSON.stringify({
+      instances: {
+        ghost: { driver: "not-a-real-driver", displayName: "Ghost" },
+        claude: { driver: "claudeAgent", displayName: "Fixture Claude", config: { cli: FAKE_CLAUDE_CLI } },
+      },
+    }),
   );
   writeFileSync(
     join(home, ".openmausbot", "groups.json"),
@@ -83,6 +91,16 @@ beforeAll(async () => {
         bulletin: "",
         unread: false,
         createdAt: 3,
+      },
+      {
+        id: "test-cancel-room",
+        threadId: "test-cancel-room-thread",
+        name: "Cancel room",
+        memberIds: ["test-bot-a"],
+        defaultResponder: { kind: "member", botId: "test-bot-a" },
+        bulletin: "",
+        unread: false,
+        createdAt: 4,
       },
       {
         id: "test-pinned-room",
@@ -116,6 +134,33 @@ beforeAll(async () => {
             subtitle: "rm -rf /tmp/scratch",
             options: ["Allow", "Deny"],
             requestId: "stranded-request",
+            tool: "Bash",
+            allowKey: "Bash:rm",
+          },
+          from: { botId: "test-bot-a", name: "Test bot A", color: "purple" },
+        },
+      ],
+    }),
+  );
+
+  // A room holding an approval nobody has answered yet, so "Cancel turn"
+  // has something open to close.
+  writeFileSync(
+    join(home, ".openmausbot", "messages-test-cancel-room-thread.json"),
+    JSON.stringify({
+      activeLeafId: "cancel-card",
+      messages: [
+        {
+          id: "cancel-card",
+          at: 4,
+          parentId: null,
+          role: "bot",
+          kind: "options",
+          card: {
+            title: "Approval needed",
+            subtitle: "rm -rf /tmp/scratch",
+            options: ["Allow", "Deny"],
+            requestId: "cancel-request",
             tool: "Bash",
             allowKey: "Bash:rm",
           },
@@ -163,6 +208,8 @@ beforeAll(async () => {
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
       OMB_COMPOSIO_API: `http://127.0.0.1:${boxStubPort}/api/v3.1`,
       OMB_STATIC_DIR: staticDir,
+      FAKE_CLAUDE_MODE: "hang",
+      FAKE_CLAUDE_DUMP: fakeClaudeDump,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -277,14 +324,19 @@ describe("harness HTTP API", () => {
   it("describes the configured fleet, shadows included", async () => {
     const { status, body } = await api("GET", "/api/instances");
     expect(status).toBe(200);
-    expect(body.instances).toHaveLength(1);
-    expect(body.instances[0]).toMatchObject({
+    const ghost = body.instances.find((instance: { instanceId: string }) => instance.instanceId === "ghost");
+    expect(ghost).toMatchObject({
       instanceId: "ghost",
       driverKind: "not-a-real-driver",
       displayName: "Ghost",
       snapshot: { state: "unavailable" },
     });
-    expect(body.instances[0].snapshot.reason).toContain("not-a-real-driver");
+    expect(ghost.snapshot.reason).toContain("not-a-real-driver");
+    expect(body.instances).toContainEqual(expect.objectContaining({
+      instanceId: "claude",
+      driverKind: "claudeAgent",
+      displayName: "Fixture Claude",
+    }));
   });
 
   it("searches transcripts and exports a conversation", async () => {
@@ -317,6 +369,31 @@ describe("harness HTTP API", () => {
     expect(JSON.stringify(asJson.body)).not.toContain('"png"');
     expect((await api("GET", `/api/threads/${bot.threadId}/export?format=pdf`)).status).toBe(400);
     expect((await api("GET", "/api/threads/nope/export")).status).toBe(404);
+
+    // one pinned message per thread: pin, round-trip, replace, clear; the
+    // id is stored verbatim — resolution is the UI's job
+    const pin = await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: "msg-abc_123" });
+    expect(pin.status).toBe(200);
+    expect(pin.body.bot).toMatchObject({ pinnedMessageId: "msg-abc_123" });
+    const repin = await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: "msg-second" });
+    expect(repin.body.bot).toMatchObject({ pinnedMessageId: "msg-second" });
+    expect((await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: "not an id!" })).status).toBe(400);
+    expect((await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: 42 })).status).toBe(400);
+    const unpinned = await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: null });
+    expect(unpinned.status).toBe(200);
+    expect(unpinned.body.bot).not.toHaveProperty("pinnedMessageId");
+
+    const room = (await api("POST", "/api/groups", { name: "Pins", memberIds: [bot.id] })).body.group;
+    const roomPin = await api("PATCH", `/api/groups/${room.id}`, { pinnedMessageId: "msg-room_1" });
+    expect(roomPin.status).toBe(200);
+    expect(roomPin.body.group).toMatchObject({ pinnedMessageId: "msg-room_1" });
+    const roomRepin = await api("PATCH", `/api/groups/${room.id}`, { pinnedMessageId: "msg-room_2" });
+    expect(roomRepin.body.group).toMatchObject({ pinnedMessageId: "msg-room_2" });
+    expect((await api("PATCH", `/api/groups/${room.id}`, { pinnedMessageId: "not an id!" })).status).toBe(400);
+    expect((await api("PATCH", `/api/groups/${room.id}`, { pinnedMessageId: 42 })).status).toBe(400);
+    const roomCleared = await api("PATCH", `/api/groups/${room.id}`, { pinnedMessageId: "" });
+    expect(roomCleared.status).toBe(200);
+    expect(roomCleared.body.group).not.toHaveProperty("pinnedMessageId");
 
     // deleted conversations drop out of search rather than 404ing it
     await api("DELETE", `/api/bots/${bot.id}`);
@@ -478,12 +555,15 @@ describe("harness HTTP API", () => {
     expect(malformed).toMatchObject({ status: 400, body: { error: "invalid model selection" } });
     expect(await persistedSelection()).toEqual(originalSelection);
 
+    // An unknown instance is persistable (users pre-configure engines) —
+    // the loud gate is startTurn, which refuses with 409 on send.
     const unavailable = await api("PATCH", `/api/bots/${bot.id}`, {
       modelSelection: { instanceId: "ghost", model: "ghost-model" },
     });
-    expect(unavailable.status).toBe(409);
-    expect(unavailable.body.error).toContain("ghost");
-    expect(await persistedSelection()).toEqual(originalSelection);
+    expect(unavailable.status).toBe(200);
+    const send = await api("POST", `/api/bots/${bot.id}/messages`, { text: "hi" });
+    expect(send.status).toBe(409);
+    expect(send.body.error).toContain("unavailable");
 
     await api("DELETE", `/api/bots/${bot.id}`);
   });
@@ -631,12 +711,15 @@ describe("harness HTTP API", () => {
       modelSelection: { instanceId: "ghost", model: "ghost-1", effort: "xhigh" },
     });
 
-    // An unknown instance cannot be verified against a catalog — the PR's
-    // validation contract rejects the selection (409) rather than persist
-    // a pick no engine can run. The persona fields stay untouched on the
-    // source bot; the copy is re-patched once a real engine exists.
-    expect(patched.status).toBe(409);
-    expect(patched.body.error).toContain("ghost");
+    // The unresolvable instance is allowed to persist — a duplicate keeps
+    // its persona fields, and the pick fails loudly at send time instead.
+    expect(patched.status).toBe(200);
+    expect(patched.body.bot).toMatchObject({
+      name: "Reviewer copy",
+      title: "Reviewer",
+      description: "reads diffs",
+    });
+    expect(patched.body.bot.modelSelection.instanceId).toBe("ghost");
   });
 
   it("turns off bot Auto mode when local computer beta is selected", async () => {
@@ -729,6 +812,21 @@ describe("harness HTTP API", () => {
     expect(nothing.status).toBe(404);
   });
 
+  it("closes the approvals a cancelled turn can no longer answer", async () => {
+    // "Cancel turn" is a button ON the approval card, and a pending approval
+    // owns the composer. Stopping the turn without closing its card leaves the
+    // room blocked by a question whose asker is already gone.
+    const stopped = await api("POST", "/api/groups/test-cancel-room/interrupt");
+    expect(stopped.status).toBe(200);
+
+    const room = (await api("GET", "/api/bots")).body.groups.find(
+      (group: { id: string }) => group.id === "test-cancel-room",
+    );
+    const card = room.messages.find((message: { id: string }) => message.id === "cancel-card").card;
+    expect(card.dismissed).toBe(true);
+    expect(card.answered).toBe("unavailable");
+  });
+
   it("rejects an empty message and explains an unavailable provider", async () => {
     const { body } = await api("GET", "/api/bots");
     const bot = body.bots[0];
@@ -736,8 +834,10 @@ describe("harness HTTP API", () => {
     const empty = await api("POST", `/api/bots/${bot.id}/messages`, { text: "   " });
     expect(empty.status).toBe(400);
 
-    // the seeded bot's selection points at the ghost instance — sending a
-    // real message must fail loudly, not 202-and-hang
+    // point the bot at the ghost instance — the PATCH succeeds (the engine
+    // being online is not required to persist a pick), but sending a real
+    // message must fail loudly, not 202-and-hang
+    await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "ghost", model: "ghost-model" } });
     const send = await api("POST", `/api/bots/${bot.id}/messages`, { text: "hello?" });
     expect(send.status).toBe(409);
     expect(send.body.error).toContain("unavailable");
@@ -804,6 +904,77 @@ describe("harness HTTP API", () => {
 
     const nothing = await api("PUT", "/api/config", {});
     expect(nothing.status).toBe(400);
+  });
+
+  it("validates and persists the global room turn timeout", async () => {
+    const before = await api("GET", "/api/config");
+    expect(before.status).toBe(200);
+    expect(before.body.rooms).toEqual({ turnTimeoutMinutes: 5 });
+
+    for (const turnTimeoutMinutes of [0, 1.5, 1441, "20", null]) {
+      const invalid = await api("PUT", "/api/config", { rooms: { turnTimeoutMinutes } });
+      expect(invalid.status).toBe(400);
+      expect(invalid.body.error).toContain("rooms.turnTimeoutMinutes");
+    }
+
+    const saved = await api("PUT", "/api/config", { rooms: { turnTimeoutMinutes: 20 } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.rooms).toEqual({ turnTimeoutMinutes: 20 });
+
+    const after = await api("GET", "/api/config");
+    expect(after.body.rooms).toEqual({ turnTimeoutMinutes: 20 });
+
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.rooms).toEqual({ turnTimeoutMinutes: 20 });
+
+    await api("PUT", "/api/config", { rooms: { turnTimeoutMinutes: 5 } });
+  });
+
+  it("keeps an active turn alive when only the room timeout changes", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const botId = created.body.bot.id;
+    const room = (await api("POST", "/api/groups", {
+      name: "Room timeout capture",
+      memberIds: [botId],
+    })).body.group;
+    try {
+      const selected = await api("PATCH", `/api/bots/${botId}`, {
+        modelSelection: { instanceId: "claude", model: "sonnet" },
+      });
+      expect(selected.status).toBe(200);
+
+      rmSync(fakeClaudeDump, { force: true });
+      const sent = await api("POST", `/api/groups/${room.id}/messages`, { text: "stay active" });
+      expect(sent.status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+
+      const before = (await api("GET", "/api/bots")).body;
+      expect(before.bots.find((bot: { id: string }) => bot.id === botId)?.busy).toBe(true);
+      expect(before.groups.find((group: { id: string }) => group.id === room.id)?.busyBotId).toBe(botId);
+
+      const saved = await api("PUT", "/api/config", { rooms: { turnTimeoutMinutes: 20 } });
+      expect(saved.status).toBe(200);
+
+      const after = (await api("GET", "/api/bots")).body;
+      expect(after.bots.find((bot: { id: string }) => bot.id === botId)?.busy).toBe(true);
+      const activeRoom = after.groups.find((group: { id: string }) => group.id === room.id);
+      expect(activeRoom?.busyBotId).toBe(botId);
+      expect(activeRoom.messages.some((message: { tool?: { name?: string } }) =>
+        message.tool?.name?.includes("provider settings changed"),
+      )).toBe(false);
+    } finally {
+      await api("POST", `/api/groups/${room.id}/interrupt`);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return {
+          botBusy: state.bots.find((bot: { id: string }) => bot.id === botId)?.busy,
+          roomBusyBotId: state.groups.find((group: { id: string }) => group.id === room.id)?.busyBotId,
+        };
+      }, { timeout: 5_000 }).toEqual({ botBusy: false, roomBusyBotId: null });
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${botId}`);
+      await api("PUT", "/api/config", { rooms: { turnTimeoutMinutes: 5 } });
+    }
   });
 
   it("validates the non-secret VPS alias and keeps old bots on Box by default", async () => {
