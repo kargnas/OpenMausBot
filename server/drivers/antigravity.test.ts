@@ -180,4 +180,35 @@ describe("Antigravity snapshot", () => {
     expect(snap.state).toBe("unavailable");
     await instance.dispose();
   });
+
+  it("strips workspace credentials from snapshot and helper children", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-env-"));
+    const dump = join(scratch, "dump.json");
+    const names = ["XAI_API_KEY", "COMPOSIO_API_KEY", "BOX_TOKEN", "OPENCODE_API_KEY", "OMB_TTS_KEY"] as const;
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    process.env.FAKE_AGY_DUMP = dump;
+    for (const name of names) process.env[name] = `${name}-must-not-leak`;
+    const instance = await AntigravityDriver.create({
+      instanceId: "agy-env",
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      await instance.snapshot();
+      for (const name of names) expect(JSON.parse(readFileSync(dump, "utf8")).env[name]).toBeUndefined();
+
+      await instance.generateText?.("summarize safely");
+      for (const name of names) expect(JSON.parse(readFileSync(dump, "utf8")).env[name]).toBeUndefined();
+    } finally {
+      await instance.dispose();
+      delete process.env.FAKE_AGY_DUMP;
+      for (const name of names) {
+        if (previous[name] === undefined) delete process.env[name];
+        else process.env[name] = previous[name];
+      }
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
 });

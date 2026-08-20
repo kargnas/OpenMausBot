@@ -11,6 +11,9 @@
 import { writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
+if (process.env.FAKE_AGY_DUMP) {
+  writeFileSync(process.env.FAKE_AGY_DUMP, JSON.stringify({ argv, env: process.env }, null, 2));
+}
 if (argv.includes("--version")) {
   console.log("1.1.12");
   process.exit(0);
@@ -33,7 +36,7 @@ if (argv.join(" ") === "models --output-format json") {
   );
   process.exit(0);
 }
-if (process.env.FAKE_AGY_DUMP) writeFileSync(process.env.FAKE_AGY_DUMP, JSON.stringify({ argv }, null, 2));
+if (process.env.FAKE_AGY_DUMP) writeFileSync(process.env.FAKE_AGY_DUMP, JSON.stringify({ argv, env: process.env }, null, 2));
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
 const CONV = "conv-fake-123";

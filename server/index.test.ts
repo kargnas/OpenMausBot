@@ -835,14 +835,23 @@ describe("harness HTTP API", () => {
     expect(rejected.status).toBe(400);
     expect(rejected.body.error).toMatch(/invalid project key/i);
 
-    const saved = await api("PUT", "/api/config?secretStorage=external", { composio: { apiKey: "ak_good" } });
+    const saved = await api("PUT", "/api/config?secretStorage=external", {
+      composio: { apiKey: "ak_good" },
+      opencodeGo: { apiKey: "opencode-external" },
+      profile: { name: "External Store" },
+    });
     expect(saved.status).toBe(200);
     expect(saved.body.composio).toEqual({ configured: true, mode: "self-hosted" });
+    expect(saved.body.opencodeGo).toEqual({ configured: true });
+    expect(saved.body.profile).toEqual({ name: "External Store", email: "" });
     expect(JSON.stringify(saved.body)).not.toContain("ak_good");
 
     const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
     expect(disk.composio).toMatchObject({ apiKey: "", sessionId: "trs_config_test" });
+    expect(disk.opencodeGo).toEqual({ apiKey: "" });
+    expect(disk.profile).toEqual({ name: "External Store" });
     expect(JSON.stringify(disk)).not.toContain("ak_good");
+    expect(JSON.stringify(disk)).not.toContain("opencode-external");
 
     // A later ordinary setting save reloads config; the in-process secure-env
     // override must keep Composio configured until the next app launch.
@@ -1396,5 +1405,60 @@ describe("instance CLI override API", () => {
     const overlapping = await api("PATCH", "/api/instances/ghost", { cli: "/tmp/ghost-overlap" });
     expect(overlapping.status).toBe(409);
     expect((await slowConfigWrite).status).toBe(200);
+  });
+});
+
+describe("computer control API (who is driving)", () => {
+  let botId = "";
+
+  beforeAll(async () => {
+    const created = await api("POST", "/api/bots", {});
+    botId = created.body.bot.id;
+  });
+
+  it("starts disengaged", async () => {
+    const res = await api("GET", `/api/bots/${botId}/computer/control`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ held: false, helpReason: null, heldSinceMs: null });
+  });
+
+  it("take → held, broadcast on the wire, release → disengaged", async () => {
+    const sse = await openSse(`${BASE}/api/events`);
+    try {
+      const took = await api("POST", `/api/bots/${botId}/computer/control`, { action: "take" });
+      expect(took.status).toBe(200);
+      expect(took.body.held).toBe(true);
+      const frame = await sse.until(
+        (f) => f.kind === "computer-control" && f.botId === botId && f.held === true,
+      );
+      expect(frame.helpReason).toBeNull();
+      const hydrated = await api("GET", "/api/bots");
+      expect(hydrated.body.computerControl[botId]).toEqual({ held: true, helpReason: null });
+      const released = await api("POST", `/api/bots/${botId}/computer/control`, { action: "release" });
+      expect(released.body.held).toBe(false);
+    } finally {
+      sse.close();
+    }
+  });
+
+  it("refuses an unknown action and an unknown bot", async () => {
+    const bad = await api("POST", `/api/bots/${botId}/computer/control`, { action: "hijack" });
+    expect(bad.status).toBe(400);
+    const ghost = await api("GET", "/api/bots/nope/computer/control");
+    expect(ghost.status).toBe(404);
+  });
+
+  it("refuses a form-shaped POST — control mutations are JSON-only", async () => {
+    const res = await fetch(`${BASE}/api/bots/${botId}/computer/control`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "action=take",
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("keeps the internal who-is-driving endpoint behind the boot token", async () => {
+    const res = await fetch(`${BASE}/api/internal/computer-control?botId=${botId}`);
+    expect(res.status).toBe(401);
   });
 });

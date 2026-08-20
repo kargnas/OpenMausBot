@@ -14,7 +14,7 @@ import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.t
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { DATA_DIR } from "../config.ts";
+import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
@@ -38,6 +38,14 @@ export interface AntigravityConfig {
   fullAuto: boolean;
 }
 
+function antigravityEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
+  // The harness process may hold workspace credentials injected by the
+  // desktop shell. Antigravity uses its own login, so none belong in any of
+  // its turn, snapshot, or helper children.
+  stripWorkspaceCredentialEnv(env);
+  return env;
+}
 function decodeConfig(raw: unknown): AntigravityConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
   if (o.cli !== undefined && typeof o.cli !== "string") {
@@ -236,7 +244,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       if (turn.effort) args.push("--effort", turn.effort);
       if (resumeCursor) args.push("--conversation", resumeCursor);
 
-      const env = { ...process.env, PATH: augmentedPath() };
+      const env = antigravityEnvironment();
 
       // spawnCli resolves npm .cmd shims / shebang scripts on Windows and
       // owns the process-group vs windowsHide difference (see procs.ts)
@@ -380,7 +388,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env: { ...process.env, PATH: augmentedPath() } }, (err, stdout) =>
+        execCli(config.cli, ["--version"], { timeout: 8000, env: antigravityEnvironment() }, (err, stdout) =>
           resolve(err ? null : stdout.trim()),
         );
       });
@@ -414,6 +422,15 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           return () => listeners.delete(listener);
         },
       },
+      generateText: (prompt: string) =>
+        new Promise((resolve, reject) => {
+          execCli(
+            config.cli,
+            ["-p", prompt, "--output-format", "text", "--model", "gemini-3.6-flash-low"],
+            { timeout: 60_000, env: antigravityEnvironment() },
+            (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
+          );
+        }),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         reapChildren(true); // escalate to SIGKILL — disposal must reap every child

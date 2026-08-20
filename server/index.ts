@@ -9,7 +9,8 @@ import { extname, join } from "node:path";
 
 import { z } from "zod";
 
-import { approvalKey, autoDecision } from "./auto-approve.ts";
+import { approvalKey, autoVerdict } from "./auto-approve.ts";
+import { appendDecision, readDecisions } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import * as box from "./box.ts";
@@ -30,11 +31,14 @@ import {
   loadConfig,
   parseConfigPatch,
   saveConfig,
+  syncCredentialEnv,
   withInstanceCli,
   vpsSshAlias,
+  DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
 } from "./config.ts";
+import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
@@ -165,6 +169,22 @@ function connectedAppsIntegration(botId: string, threadId: string) {
     botId,
     threadId,
   });
+}
+
+// ── computer control (who is driving) ──────────────────────────────────
+// The person can take the wheel of a bot's computer from the panel; while
+// they hold it, the bot's computer proxies refuse every action. The record
+// lives here; the proxies consult it over loopback with the boot token.
+const computerControl = new ComputerControl((botId, snapshot) => {
+  broadcast({ kind: "computer-control", botId, held: snapshot.held, helpReason: snapshot.helpReason });
+});
+
+/** The loopback endpoint a bot's computer proxy polls before acting. */
+function controlIntegration(botId: string) {
+  return {
+    url: `http://127.0.0.1:${PORT}/api/internal/computer-control?botId=${encodeURIComponent(botId)}`,
+    token: COMMS_TOKEN,
+  };
 }
 
 /** Run a turn on `targetBotId` and resolve with its assistant text — the
@@ -405,7 +425,20 @@ async function answerRequest(
   requestId: string,
   behavior: "allow" | "deny" | "answer",
   message?: string,
+  decidedFor?: { id: string; name: string },
 ): Promise<RequestOutcome> {
+  // Snapshot the card BEFORE delivering the answer: a delivered answer
+  // resolves the request synchronously through the fold, which consumes
+  // the askMessageByRequest entry — by the time the await returns, nobody
+  // remembers which tool this requestId was about.
+  const thread = store.messagesFor(threadId);
+  const cardMessageId = askMessageByRequest.get(`${threadId}:${requestId}`);
+  // The map is an in-flight optimization and disappears on restart; the
+  // durable transcript still carries the request id and its audit metadata.
+  const cardMessage = cardMessageId
+    ? thread.find((m) => m.id === cardMessageId)
+    : thread.find((m) => m.card?.requestId === requestId);
+  const card = cardMessage?.card;
   const instance = registry.get(instanceId);
   let outcome: RequestOutcome = "unavailable";
   if (instance) {
@@ -414,6 +447,23 @@ async function answerRequest(
     } catch {
       outcome = "unavailable";
     }
+  }
+  // The human's verdict, recorded only when it actually reached the engine:
+  // `unavailable` means the action never ran, and a "user-approved" row
+  // over a request nothing answered would be the audit log lying. A
+  // question's `answer` is conversation, not authorization, so it is not a
+  // decision either.
+  if (outcome !== "unavailable" && behavior !== "answer") {
+    appendDecision(DATA_DIR, {
+      threadId,
+      requestId,
+      botId: decidedFor?.id,
+      botName: decidedFor?.name,
+      tool: card?.tool,
+      summary: card?.subtitle,
+      decision: behavior === "allow" ? "user-approved" : "user-denied",
+      source: "user",
+    });
   }
   if (outcome === "unavailable") {
     // The in-flight map is memory-only. After a restart the card is still on
@@ -669,13 +719,12 @@ bus.subscribe((event: RuntimeEvent) => {
       // whole point of asking is that a person decides — and anything that
       // looks destructive stops even in auto mode.
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
-      const settled = permission && asker && event.requestId
-        ? autoDecision(asker, event.tool, event.summary, {
-            unattended: isUnattended(asker.id),
-            scope: event.approvalScope,
-          })
+      const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      const verdict = permission && asker && event.requestId
+        ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
         : null;
-      if (settled && asker && event.requestId) {
+      if (verdict?.approve && asker && event.requestId) {
+        const settled = verdict.approve;
         const instance = event.providerInstanceId
           ? registry.get(event.providerInstanceId)
           : registry.get(asker.modelSelection.instanceId);
@@ -694,6 +743,20 @@ bus.subscribe((event: RuntimeEvent) => {
               role: "bot",
               kind: "activity",
               tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: true },
+            });
+            // logged under the same discipline as the chip: only once the
+            // provider has actually taken the answer, so the audit log
+            // never claims an approval nothing received
+            appendDecision(DATA_DIR, {
+              threadId: event.threadId,
+              requestId,
+              botId: asker.id,
+              botName: asker.name,
+              tool,
+              summary,
+              decision: "auto-approved",
+              source: verdict.source,
+              rule: verdict.rule,
             });
           } catch {
             // couldn't answer it for them — hand it back to the human
@@ -718,6 +781,17 @@ bus.subscribe((event: RuntimeEvent) => {
               },
             });
             askMessageByRequest.set(`${event.threadId}:${requestId}`, card.id);
+            appendDecision(DATA_DIR, {
+              threadId: event.threadId,
+              requestId,
+              botId: asker.id,
+              botName: asker.name,
+              tool,
+              summary,
+              decision: "card-shown",
+              source: "auto-fallback",
+              rule: verdict.rule,
+            });
           }
         })();
         break;
@@ -753,6 +827,23 @@ bus.subscribe((event: RuntimeEvent) => {
         },
       });
       if (event.requestId) askMessageByRequest.set(`${event.threadId}:${event.requestId}`, message.id);
+      // Every card that reaches a human is a decision too — "a rule sent
+      // this to you, and here is which one". `question` marks the cards no
+      // rule may ever answer; a permission card without a verdict (no known
+      // asker, or no requestId to answer through) can only mean nothing was
+      // granted.
+      appendDecision(DATA_DIR, {
+        threadId: event.threadId,
+        requestId: event.requestId,
+        botId: asker?.id,
+        botName: asker?.name,
+        tool: event.tool,
+        summary: event.summary,
+        decision: "card-shown",
+        source: !permission ? "question" : verdict ? verdict.source : "no-grant",
+        rule: verdict?.rule,
+        unattended: unattended || undefined,
+      });
       // Notify from HERE, not from a separate subscriber on request.opened:
       // this is the branch where a card actually reached a human. Anything
       // auto mode answered took the early return above and never buzzes.
@@ -1317,7 +1408,7 @@ async function startTurn(
         if (!localVm.ready || !localVm.runtime) {
           throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
         }
-        integrations.localComputer = containerComputerMcp(localVm.runtime);
+        integrations.localComputer = containerComputerMcp(localVm.runtime, controlIntegration(bot.id));
         computerKind = "vm";
       } else if (wants === "local") {
         if (!shouldMountLocalComputer({
@@ -1346,7 +1437,12 @@ async function startTurn(
             : await vps.reuseVps(cfg, bot.id);
           if (remote?.ready && remote.sshAlias) {
             const targetCfg = { ...cfg, vps: { sshAlias: remote.sshAlias } };
-            integrations.localComputer = vps.vpsComputerMcp(targetCfg, bot.id, remote.container_id ?? undefined);
+            const vpsMcp = vps.vpsComputerMcp(targetCfg, bot.id, remote.container_id ?? undefined);
+            const vpsControl = controlIntegration(bot.id);
+            integrations.localComputer = {
+              ...vpsMcp,
+              env: { ...vpsMcp.env, OMB_CONTROL_URL: vpsControl.url, OMB_CONTROL_TOKEN: vpsControl.token },
+            };
             computerKind = "vps";
             previewCapture = () => vps.vpsComputerScreenshot(targetCfg, bot.id);
           } else {
@@ -1383,7 +1479,12 @@ async function startTurn(
         if (b) {
           previewCapture = () => box.screenshotBox(cfg, bot.id, b!.id);
           if (mountsCloudComputer) {
-            integrations.computer = { kind: "box", boxId: b.id, token: cfg.box!.token! };
+            integrations.computer = {
+              kind: "box",
+              boxId: b.id,
+              token: cfg.box!.token!,
+              control: controlIntegration(bot.id),
+            };
             computerKind = "box";
           }
         }
@@ -2333,6 +2434,32 @@ const server = createServer(async (req, res) => {
         res.writeHead(upstream.status, headers);
         return res.end(Buffer.from(upstream.bytes));
       }
+      // ── computer control: proxies read the hold, bots plead for help ──
+      if (path === "/api/internal/computer-control") {
+        const botId = url.searchParams.get("botId") ?? "";
+        const bot = store.bot(botId);
+        if (!bot) return json(res, 404, { error: "no such bot" });
+        if (method === "GET") {
+          const snapshot = computerControl.snapshot(botId);
+          return json(res, 200, { held: snapshot.held, helpOpen: snapshot.helpReason !== null });
+        }
+        if (method === "POST") {
+          const body = await readBody(req);
+          const { snapshot, requestId } = computerControl.requestHelpLease(botId, body.reason);
+          // worth a buzz: the bot is blocked on the person's hands, which
+          // is exactly the "blocked on you" rule notify.ts encodes
+          notify(
+            buildNotification("takeover", bot, bot.threadId, snapshot.helpReason ?? "asked you to take over"),
+          );
+          return json(res, 200, { held: snapshot.held, helpOpen: snapshot.helpReason !== null, requestId });
+        }
+        if (method === "DELETE") {
+          const body = await readBody(req);
+          const snapshot = computerControl.expireHelp(botId, body.requestId);
+          return json(res, 200, { held: snapshot.held, helpOpen: snapshot.helpReason !== null });
+        }
+        return json(res, 405, { error: "method not allowed" });
+      }
       if (method === "POST" && path === "/api/internal/connectors/request") {
         const body = await readBody(req);
         const botId = String(body.botId ?? "");
@@ -2515,6 +2642,12 @@ const server = createServer(async (req, res) => {
       return json(res, 200, {
         bots: store.bots.map((bot) => ({ ...publicBot(bot), ...messagePage(bot.threadId, limit) })),
         groups: store.groups.map((g) => ({ ...g, ...messagePage(g.threadId, limit) })),
+        computerControl: Object.fromEntries(
+          store.bots.map((bot) => {
+            const snapshot = computerControl.snapshot(bot.id);
+            return [bot.id, { held: snapshot.held, helpReason: snapshot.helpReason }];
+          }),
+        ),
       });
     }
 
@@ -3076,6 +3209,7 @@ const server = createServer(async (req, res) => {
       // now, and its caller would otherwise wait out the 15-minute timeout
       cancelPeerApprovalsFor(bot.id);
       discardDelegations(commsBus, bot.threadId);
+      computerControl.forget(bot.id);
       store.deleteBot(bot.id);
       for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
         try {
@@ -3222,7 +3356,7 @@ const server = createServer(async (req, res) => {
       if (resolvePeerComms(approvalBus, String(body.requestId), behavior)) {
         return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
       }
-      const outcome = await answerRequest(bot.threadId, bot.modelSelection.instanceId, String(body.requestId), behavior, body.message);
+      const outcome = await answerRequest(bot.threadId, bot.modelSelection.instanceId, String(body.requestId), behavior, body.message, { id: bot.id, name: bot.name });
       return json(res, 200, { ok: true, outcome });
     }
     // Answer by THREAD, so a request raised inside a room can be answered
@@ -3253,7 +3387,7 @@ const server = createServer(async (req, res) => {
           (pending?.from ? store.bot(pending.from.botId) : undefined)
         : store.botByThread(threadId);
       if (!owner && !pending) return json(res, 404, { error: "nothing is waiting on an answer in this conversation" });
-      const outcome = await answerRequest(threadId, owner?.modelSelection.instanceId ?? "", requestId, behavior, body.message);
+      const outcome = await answerRequest(threadId, owner?.modelSelection.instanceId ?? "", requestId, behavior, body.message, owner ? { id: owner.id, name: owner.name } : undefined);
       return json(res, 200, { ok: true, outcome });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/interrupt$/);
@@ -3393,6 +3527,19 @@ const server = createServer(async (req, res) => {
       return json(res, 200, readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit }));
     }
 
+    // ── the fleet-wide authorization decision log ──
+    // Read-only like the inspector above: the rows were written at the
+    // request.opened fold and in answerRequest; this only reads them back,
+    // newest last, same order as thread events.
+    if (method === "GET" && path === "/api/decisions") {
+      const rawLimit = url.searchParams.get("limit");
+      const parsedLimit = rawLimit === null ? undefined : Number(rawLimit);
+      if (parsedLimit !== undefined && (!Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
+        return json(res, 400, { error: "limit must be a positive whole number" });
+      }
+      return json(res, 200, { decisions: readDecisions(DATA_DIR, parsedLimit ?? 200) });
+    }
+
     // ── provider instances (model picker) ──
     if (method === "GET" && path === "/api/instances") {
       // Rescan PATH first: this endpoint is how the app answers "what can I
@@ -3519,17 +3666,27 @@ const server = createServer(async (req, res) => {
         if (!check.ok) return json(res, 400, { error: check.message });
       }
       const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
-      if (externalSecretStorage && patch.composio) {
-        // Electron stores the project key with OS-backed encryption. Persist
-        // only the non-secret Session ids here, while keeping the supplied
-        // key live in this process until the next launch injects it by env.
-        const composioPatch = patch.composio;
-        const { apiKey: _secret, ...metadata } = composioPatch;
-        saveConfig({ composio: { ...metadata, apiKey: "" } });
-        cfg.composio = { ...cfg.composio, ...composioPatch };
-        if (composioPatch.apiKey !== undefined) process.env.COMPOSIO_API_KEY = composioPatch.apiKey;
+      if (externalSecretStorage) {
+        // The packaged Electron caller commits supplied credentials to the
+        // OS-encrypted store before entering this route. Persist every
+        // non-secret sibling in the same request, but replace each supplied
+        // credential with an empty tombstone so an older plaintext value can
+        // never survive the merge in config.json.
+        const persisted = structuredClone(patch);
+        if (persisted.xai?.key !== undefined) persisted.xai.key = "";
+        if (persisted.composio?.apiKey !== undefined) persisted.composio.apiKey = "";
+        if (persisted.box?.token !== undefined) persisted.box.token = "";
+        if (persisted.opencodeGo?.apiKey !== undefined) persisted.opencodeGo.apiKey = "";
+        if (persisted.tts?.key !== undefined) persisted.tts.key = "";
+        saveConfig(persisted);
+        syncCredentialEnv(patch);
+        Object.assign(cfg, loadConfig());
       } else {
         saveConfig(patch);
+        // loadConfig prefers env over the file for credentials, so the env
+        // must follow the save — otherwise the value injected at boot would
+        // shadow the new key until the next launch
+        syncCredentialEnv(patch);
         Object.assign(cfg, loadConfig());
       }
       // provider keys change the fleet; a profile or voice edit must not
@@ -3664,6 +3821,29 @@ const server = createServer(async (req, res) => {
       return bot.cloudBackend === "vps"
         ? json(res, 200, { backend: "vps", ...(await vps.vpsComputerStatus(cfg, bot.id)) })
         : json(res, 200, { backend: "box", ...(await box.boxStatus(cfg, bot.id)) });
+    }
+    // Who is driving this bot's computer. GET is the panel's initial read;
+    // POST take/release/dismiss-help are the person's three moves. The bot
+    // has no verb here at all — its only voice is the internal help plea.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/control$/);
+    if (m) {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (method === "GET") return json(res, 200, computerControl.snapshot(bot.id));
+      if (method === "POST") {
+        // JSON-only for the same anti-form-POST reason as every other
+        // computer mutation below.
+        if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+          return json(res, 415, { error: "content-type must be application/json" });
+        }
+        const body = await readBody(req);
+        const action = String(body.action ?? "");
+        if (action === "take") return json(res, 200, computerControl.take(bot.id));
+        if (action === "release") return json(res, 200, computerControl.release(bot.id));
+        if (action === "dismiss-help") return json(res, 200, computerControl.dismissHelp(bot.id));
+        return json(res, 400, { error: "action must be take, release, or dismiss-help" });
+      }
+      return json(res, 405, { error: "method not allowed" });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot|remove)$/);
     if (m && method === "POST") {

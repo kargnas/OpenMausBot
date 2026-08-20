@@ -29,7 +29,7 @@
     "dev:desktop": "electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
-    "test": "vitest run && pnpm broker:test && pnpm test:updater && pnpm test:packaged-server",
+    "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:packaged-server",
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs",
     "bench:observation": "node --experimental-strip-types scripts/bench-observation.ts",
     "test:watch": "vitest",
@@ -90,5 +90,13 @@
     "vite": "^7.1.0",
     "vitest": "^4.1.10",
     "wrangler": "4.123.0"
+  },
+  "pnpm": {
+    "supportedArchitectures": {
+      "cpu": [
+        "arm64",
+        "x64"
+      ]
+    }
   }
 }
