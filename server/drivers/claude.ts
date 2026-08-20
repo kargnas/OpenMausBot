@@ -679,6 +679,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           computerMcp: true,
           composioMcp: true,
           phoneMcp: true,
+          images: true,
           localComputerMcp: config.permissionMode !== "bypassPermissions",
         },
         sendTurn,

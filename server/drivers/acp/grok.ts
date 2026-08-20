@@ -185,6 +185,7 @@ export function ensureGrokInjectSlug(
 const support: AcpSupport = {
   driverKind: "grokAgent",
   displayName: "Grok",
+  images: false,
   resolveModels: (env) => mergeLocalInject(readGrokModelCatalog(env), env),
   defaultCli: "grok",
   nativeSource: "grok.acp",

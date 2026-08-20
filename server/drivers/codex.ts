@@ -554,6 +554,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           composioMcp: true,
           agentsMcp: true,
           phoneMcp: true,
+          images: true,
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

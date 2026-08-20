@@ -171,6 +171,8 @@ export interface Bot {
   voice?: string;
   pinned?: boolean;
   hidden?: boolean;
+  /** Sidebar section this bot renders under; absent = unsectioned. */
+  section?: string;
   /** the one message pinned to the top of this bot's active thread */
   pinnedMessageId?: string;
   /** The workspace's one primary coordinator. */
@@ -290,6 +292,7 @@ export interface InstanceInfo {
     computerMcp?: boolean;
     agentsMcp?: boolean;
     composioMcp?: boolean;
+    images?: boolean;
     localComputerMcp?: boolean;
   };
   /** `custom` agents sit below the rail divider — no subscription catalog. */
@@ -455,6 +458,7 @@ export type Action =
           | "voice"
           | "pinned"
           | "hidden"
+          | "section"
           | "pinnedMessageId"
           | "chiefOfStaff"
           | "approvePeerComms"

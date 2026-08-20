@@ -206,6 +206,11 @@ export interface ProviderAdapter {
     composioMcp?: boolean;
     /** True when the driver can mount the first-party physical-phone MCP. */
     phoneMcp?: boolean;
+    /** True when this engine accepts images in the prompt — gates image
+     * paste in the composer. Same rule as computerMcp: never offer an
+     * attachment an engine cannot open (a bot told it has an image it
+     * cannot read burns the turn). */
+    images?: boolean;
     /** True only when local MCP calls can reach the human approval channel.
      * Full-auto/bypass provider instances must leave this false. */
     localComputerMcp?: boolean;
