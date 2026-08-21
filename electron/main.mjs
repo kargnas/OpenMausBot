@@ -668,6 +668,7 @@ ipcMain.handle("perm:open-settings", (_event, pane) => {
     mic: "Privacy_Microphone",
     screen: "Privacy_ScreenCapture",
     speech: "Privacy_SpeechRecognition",
+    accessibility: "Privacy_Accessibility",
   };
   // own-property lookup only — a renderer-supplied "__proto__"/"constructor"
   // would otherwise resolve up the prototype chain to a truthy object
@@ -733,6 +734,7 @@ const CREDENTIAL_PATCH = {
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
   ttsKey: (value) => ({ tts: { key: value } }),
+  openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
 };
 
 ipcMain.handle("credential:set", async (_event, name, value) => {

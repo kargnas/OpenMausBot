@@ -8,11 +8,19 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
+import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
 
 import { approvalKey, autoVerdict } from "./auto-approve.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
-import { extensionForMime, IMAGE_MAX_BYTES, readAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
+import { attachmentExists, extensionForMime, IMAGE_MAX_BYTES, readAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
+import {
+  avatarGenerationRequestSchema,
+  avatarGenerationStateMatches,
+  generateAvatarImage,
+  snapshotAvatarGenerationState,
+} from "./avatar-image.ts";
+import { parseBotProfilePatch } from "./bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnStallRegistry, roomTurnTimeoutMessage, scheduleRoomTurnTimeout } from "./room-turn-timeout.ts";
 import * as box from "./box.ts";
@@ -260,8 +268,15 @@ const wireTask = ({ resumeCursors, lastInstanceId, ...task }: TaskRecord) => tas
 
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
   const { resumeCursors, tasks, ...rest } = bot;
-  return { ...rest, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
+  return { ...rest, avatarUrl: rest.avatarUrl ?? null, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
 };
+
+/** Profile URLs are app-owned references, not merely strings with a trusted
+ * prefix. Resolve them before persistence so every accepted avatar can be
+ * fetched immediately and a deleted/guessed attachment id cannot become a
+ * dangling profile reference. */
+const storedAvatarExists = (avatarUrl: string): boolean =>
+  attachmentExists(avatarUrl.slice("/api/attachments/".length));
 
 const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
   ...wireBot(bot),
@@ -709,7 +724,7 @@ bus.subscribe((event: RuntimeEvent) => {
     releaseLocalVmThread(event.threadId);
   }
   broadcast({ kind: "runtime", event });
-  routines?.handleRuntimeEvent(event);
+  const routineRun = routines?.handleRuntimeEvent(event) ?? null;
   const bot = store.botByThread(event.threadId);
   const group = bot ? undefined : store.groupByThread(event.threadId);
   if (!bot && !group) return;
@@ -833,10 +848,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 allowKey: event.approvalScope
                   ? undefined
                   : approvalKey(tool, summary, event.approvalScope),
-                held:
-                  event.approvalScope === "local-computer"
-                    ? "Local computer actions always require your approval in this beta."
-                    : "Auto mode couldn't answer this one.",
+                held: "Auto mode couldn't answer this one.",
                 approvalScope: event.approvalScope,
               },
             });
@@ -878,11 +890,9 @@ bus.subscribe((event: RuntimeEvent) => {
               : undefined,
           // in auto mode a card can only mean the guard stopped it — say so
           held:
-            permission && event.approvalScope === "local-computer"
-              ? "Local computer actions always require your approval in this beta."
-              : permission && asker?.autoApprove
-                ? "This looked destructive, so auto mode stopped to ask."
-                : undefined,
+            permission && asker?.autoApprove
+              ? "This looked destructive, so auto mode stopped to ask."
+              : undefined,
           approvalScope: event.approvalScope,
         },
       });
@@ -973,7 +983,9 @@ bus.subscribe((event: RuntimeEvent) => {
         // settled → idle; a setup failure already marked it dead, keep that
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
         store.patchBot(bot.id, { unread: true });
-        notify(buildNotification("done", bot, event.threadId, reply));
+        if (routineRun?.status !== "failed") {
+          notify(buildNotification("done", bot, event.threadId, reply));
+        }
         if (screenPollers.has(bot.id)) {
           // the last live frame becomes a settled inline screen message —
           // the screenshot-in-chat moment. One fresh capture first, so the
@@ -1717,6 +1729,12 @@ routines = new RoutineManager({
         : null;
     await instance?.adapter.interruptTurn(threadId);
   },
+  onRunFailed: (run) => {
+    const bot = store.bot(run.botId);
+    if (!bot) return;
+    const detail = run.error ? `${run.routineName}: ${run.error}` : run.routineName;
+    notify(buildNotification("routine-failed", bot, run.threadId ?? bot.threadId, detail));
+  },
 });
 routines.start();
 
@@ -2189,6 +2207,7 @@ function cliProbeEnvironment(): NodeJS.ProcessEnv {
     "COMPOSIO_API_KEY",
     "OMB_COMPOSIO_BROKER_TOKEN",
     "OMB_TTS_KEY",
+    "OMB_OPENAI_IMAGE_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
   ]) {
@@ -2249,6 +2268,7 @@ function configStatus() {
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
     tts: tts.describeVoice(cfg),
+    imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
     rooms: { turnTimeoutMinutes: roomTurnTimeoutMinutes(cfg) },
@@ -3219,6 +3239,54 @@ const server = createServer(async (req, res) => {
         },
       });
     }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/avatar\/generate$/);
+    if (m && method === "POST") {
+      const existing = store.bot(m[1]);
+      if (!existing) return json(res, 404, { error: "no such bot" });
+      // Generation is slow and both desktop and companion clients may edit or
+      // delete this bot while it is in flight. Snapshot the two fields this
+      // request owns before the first await so a late result cannot win.
+      const initialAvatar = snapshotAvatarGenerationState(existing);
+      const parsed = avatarGenerationRequestSchema.safeParse(await readBody(req));
+      if (!parsed.success) {
+        return json(res, 400, { error: `prompt must be at most 400 characters` });
+      }
+      const generated = await generateAvatarImage(cfg.imageGen?.key ?? "", existing, parsed.data.prompt);
+      const current = store.bot(existing.id);
+      if (!current) return json(res, 404, { error: "no such bot" });
+      if (!avatarGenerationStateMatches(initialAvatar, current)) {
+        return json(res, 409, { error: "avatar changed while generation was in progress" });
+      }
+      const saved = saveImage(generated.bytes, generated.mime);
+      const avatarUrl = botAvatarUrlFromStoredPath(saved.path);
+      if (!avatarUrl) throw Object.assign(new Error("Could not store the generated avatar"), { status: 500 });
+      const avatarCrop = initialAvatar.avatarCrop && initialAvatar.avatarCrop !== "mascot"
+        ? initialAvatar.avatarCrop
+        : "circle";
+      const bot = store.patchBot(current.id, { avatarUrl, avatarCrop });
+      if (!bot) {
+        // There are no awaits between the refreshed lookup and this patch, but
+        // keep the attachment invariant explicit if the store ever changes.
+        try { unlinkSync(saved.path); } catch {}
+        return json(res, 404, { error: "no such bot" });
+      }
+      const visible = wireBot(bot);
+      broadcast({ kind: "bot", bot: visible });
+      return json(res, 201, { avatarUrl, bot: visible });
+    }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/profile$/);
+    if (m && method === "PATCH") {
+      const parsed = parseBotProfilePatch(await readBody(req), true);
+      if (!parsed.ok) return json(res, 400, { error: parsed.error });
+      if (parsed.patch.avatarUrl && !storedAvatarExists(parsed.patch.avatarUrl)) {
+        return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
+      }
+      const bot = store.patchBot(m[1], parsed.patch);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      const visible = wireBot(bot);
+      broadcast({ kind: "bot", bot: visible });
+      return json(res, 200, { bot: visible });
+    }
     m = path.match(/^\/api\/bots\/([\w-]+)\/read$/);
     if (m && method === "POST") {
       const bot = store.patchBot(m[1], { unread: false });
@@ -3254,18 +3322,16 @@ const server = createServer(async (req, res) => {
     if (m && method === "PATCH") {
       const body = await readBody(req);
       const existingBot = store.bot(m[1]);
-
-      // Persona fields reach system prompts (this bot's own, the Chief of
-      // Staff roster, room rosters) — bound them at the only write boundary
-      // rather than trusting every prompt-assembly site to defend itself.
-      // Caps match the team-manifest import limits.
-      for (const [field, max] of [["name", 100], ["title", 200], ["description", 4000]] as const) {
-        const value = body[field];
-        if (value === undefined) continue;
-        if (typeof value !== "string") return json(res, 400, { error: `${field} must be a string` });
-        if (value.length > max) return json(res, 400, { error: `${field} must be at most ${max} characters` });
-        if (field === "name" && !value.trim()) return json(res, 400, { error: "name must not be empty" });
+      // Persona/profile fields reach prompts and paired clients. Both this
+      // broad desktop endpoint and the paired-safe profile endpoint pass
+      // through the same validation and clear-value normalization.
+      const profile = parseBotProfilePatch(body);
+      if (!profile.ok) return json(res, 400, { error: profile.error });
+      if (profile.patch.avatarUrl && !storedAvatarExists(profile.patch.avatarUrl)) {
+        return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
       }
+      const patch: Record<string, unknown> = {};
+      Object.assign(patch, profile.patch);
       let section: string | undefined | null;
       if (body.section !== undefined) {
         if (body.section === null) section = null;
@@ -3277,8 +3343,7 @@ const server = createServer(async (req, res) => {
           else section = trimmed;
         }
       }
-      const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "cloudBackend", "color", "mascotExpression", "pinned", "hidden", "speakReplies", "voice"] as const) {
+      for (const key of ["modelSelection", "unread", "computer", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       if (body.modelSelection !== undefined) {
@@ -3352,7 +3417,6 @@ const server = createServer(async (req, res) => {
       if (body.cloudBackend !== undefined && !["box", "vps"].includes(String(body.cloudBackend))) {
         return json(res, 400, { error: "cloudBackend must be box or vps" });
       }
-      const effectiveComputer = body.computer ?? existingBot?.computer;
       if (body.chiefOfStaff !== undefined && typeof body.chiefOfStaff !== "boolean") {
         return json(res, 400, { error: "chiefOfStaff must be true or false" });
       }
@@ -3373,10 +3437,21 @@ const server = createServer(async (req, res) => {
       // still answer .includes() — with substring matches, not tool names
       if (body.autoApprove !== undefined) {
         if (typeof body.autoApprove !== "boolean") return json(res, 400, { error: "autoApprove must be true or false" });
-        if (body.autoApprove === true && effectiveComputer === "local") {
-          return json(res, 400, { error: "Auto mode is unavailable while this bot uses the local computer beta" });
-        }
         patch.autoApprove = body.autoApprove;
+      }
+      // "Auto on this Mac" hands a bot the user's real session, so the grant
+      // must prove a human saw the warning. The desktop dialog is the only
+      // caller that sends acknowledgeLocalAuto; without it a PATCH that would
+      // create the combination — a bot curling the loopback API from a tool
+      // call, a script, a stale client — is refused. The renderer dialog
+      // alone is not a boundary; this check is.
+      const wantsComputer = body.computer !== undefined ? body.computer : existingBot?.computer;
+      const wantsAuto = body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true;
+      const alreadyGranted = existingBot?.computer === "local" && existingBot?.autoApprove === true;
+      if (wantsComputer === "local" && wantsAuto === true && !alreadyGranted && body.acknowledgeLocalAuto !== true) {
+        return json(res, 400, {
+          error: "Auto mode on this computer requires confirming the warning first (acknowledgeLocalAuto)",
+        });
       }
       if (body.approvePeerComms !== undefined) {
         if (typeof body.approvePeerComms !== "boolean") {
@@ -3389,9 +3464,6 @@ const server = createServer(async (req, res) => {
           return json(res, 400, { error: "alwaysAllow must be a list of tool keys" });
         }
         patch.alwaysAllow = [...new Set(body.alwaysAllow as string[])].slice(0, 200);
-      }
-      if (effectiveComputer === "local" && body.autoApprove === undefined && existingBot?.autoApprove) {
-        patch.autoApprove = false;
       }
       if (existingBot?.computer === "local" && body.computer !== undefined && body.computer !== "local") {
         await registry
@@ -3537,11 +3609,19 @@ const server = createServer(async (req, res) => {
       if (!text) return json(res, 400, { error: "text required" });
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      // A busy bot no longer refuses the message: it lands in the thread
-      // now (marked queued) and auto-sends when the turn settles — see the
-      // steer-queue drain above. Synchronous from the busy check to the
-      // queue insert, so a settle can't slip between them and strand it.
+      // Claude can accept the message inside its live turn. If the write
+      // loses a race with turn settlement, or the engine cannot steer, the
+      // existing server-side queue records it atomically for the next turn.
       if (bot.busy) {
+        const instance = registry.get(bot.modelSelection.instanceId);
+        if (instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+          const steered = await instance.adapter.steer(bot.threadId, text).catch(() => false);
+          if (steered) {
+            clearUnattended(bot.id);
+            store.appendMessage(bot.threadId, { role: "user", kind: "text", text, steered: true });
+            return json(res, 202, { ok: true, steered: true });
+          }
+        }
         const message = queueSteeredMessage(store, bot, text);
         return json(res, 202, { ok: true, queued: true, messageId: message.id });
       }
@@ -4030,6 +4110,7 @@ const server = createServer(async (req, res) => {
         if (persisted.box?.token !== undefined) persisted.box.token = "";
         if (persisted.opencodeGo?.apiKey !== undefined) persisted.opencodeGo.apiKey = "";
         if (persisted.tts?.key !== undefined) persisted.tts.key = "";
+        if (persisted.imageGen?.key !== undefined) persisted.imageGen.key = "";
         saveConfig(persisted);
         syncCredentialEnv(patch);
         Object.assign(cfg, loadConfig());
@@ -4048,6 +4129,7 @@ const server = createServer(async (req, res) => {
         (key) =>
           key !== "profile" &&
           key !== "tts" &&
+          key !== "imageGen" &&
           key !== "vps" &&
           key !== "rooms" &&
           key !== "localVm",
@@ -4110,6 +4192,12 @@ const server = createServer(async (req, res) => {
       const { cards, source } = await composio.listToolkits(cfg);
       return json(res, 200, { configured: composio.configured(cfg), mode: composio.connectionMode(cfg), source, cards });
     }
+    if (method === "GET" && path === "/api/connectors/connected") {
+      if (!composio.configured(cfg)) {
+        return json(res, 200, { configured: false, services: {} });
+      }
+      return json(res, 200, { configured: true, services: await composio.connectedServices(cfg) });
+    }
     if (method === "GET" && path === "/api/connectors") {
       const services = (url.searchParams.get("services") ?? "").split(",").filter(Boolean);
       if (!composio.configured(cfg)) {
@@ -4119,7 +4207,12 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { configured: true, services: status });
     }
     m = path.match(/^\/api\/connectors\/([\w-]+)\/authorize$/);
-    if (m && method === "POST") return json(res, 200, await composio.authorizeService(cfg, m[1]));
+    if (m && method === "POST") {
+      const body = await readBody(req);
+      return json(res, 200, await composio.authorizeService(cfg, m[1], body.alias));
+    }
+    m = path.match(/^\/api\/connectors\/([\w-]+)\/accounts\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/);
+    if (m && method === "DELETE") return json(res, 200, await composio.removeAccount(cfg, m[1], m[2]));
     m = path.match(/^\/api\/connectors\/([\w-]+)$/);
     if (m && method === "DELETE") return json(res, 200, await composio.removeService(cfg, m[1]));
 
