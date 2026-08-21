@@ -120,6 +120,24 @@ export function ensureDroidInjectModel(
   return id;
 }
 
+/** ACP `session/new` throws "Authentication required" unless a Factory
+ *  login or FACTORY_API_KEY is present — even for a BYOK custom model.
+ *  Droid 0.198 only checks that the env var is set, then uses the
+ *  custom row's own key for the local host. Do not invent a key for
+ *  subscription models, and do not overwrite a real Factory key. */
+export function applyDroidLocalAuthEnv(
+  env: Record<string, string | undefined>,
+  modelId: string | undefined,
+): void {
+  if (!decodeInjectId(modelId)) return;
+  if (env.FACTORY_API_KEY?.trim()) return;
+  // session/new already succeeds on a Factory login file. A placeholder
+  // FACTORY_API_KEY can take precedence over that login, so leave env
+  // alone when one of the auth files is present.
+  if (authFilePaths(env).some(existsSync)) return;
+  env.FACTORY_API_KEY = "openmausbot-local";
+}
+
 function readSettings(env: Record<string, string | undefined>): FactorySettings {
   return JSON.parse(readFileSync(join(factoryHome(env), ".factory", "settings.json"), "utf8")) as FactorySettings;
 }
@@ -262,6 +280,11 @@ const support: AcpSupport = {
   // never be what makes an otherwise logged-out instance look ready.
   isAuthenticated: (env) => authFilePaths(env).some(existsSync) || Boolean(env.FACTORY_API_KEY),
   catalog: async (config, env) => mergeLocalInject(await readDroidCatalog(config.cli, env), env),
+
+  resolveTurnModel: (model, env) => (model ? ensureDroidInjectModel(model, env) : model),
+  applyTurnEnv: (env, { requestedModel }) => {
+    applyDroidLocalAuthEnv(env, requestedModel);
+  },
 
   async configureSession({ request, sessionId, config, env, turn }) {
     const modeId = config.fullAuto ? MODE_FULL_AUTO : MODE_DEFAULT;

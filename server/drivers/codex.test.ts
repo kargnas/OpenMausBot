@@ -86,7 +86,9 @@ describe("CodexDriver turns (fake app-server)", () => {
       "turn.started",
       "session.started",
       "item.started", // commandExecution ls -la
+      "item.started", // webSearch OpenMausBot
       "item.completed", // commandExecution done
+      "item.completed", // webSearch done
       "content.delta",
       "item.completed", // assistant_text
       "thread.token-usage.updated",
@@ -101,6 +103,10 @@ describe("CodexDriver turns (fake app-server)", () => {
       input: 7,
       output: 3,
     });
+    expect(recorder.events.filter((event) => event.itemId === "w1")).toMatchObject([
+      { type: "item.started", itemType: "tool", title: "web_search" },
+      { type: "item.completed", itemType: "tool", ok: true },
+    ]);
     // codex reports the THREAD total; the driver turns it into this turn's
     // figure so the harness never sums a running total
     expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 7, output: 3 } });
@@ -116,6 +122,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(turnStart.params.input[0].text).toBe("You are Testy.\n\nlist files");
     const threadStart = seen.calls.find((c: { method: string }) => c.method === "thread/start");
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
+  });
+
+  it("keeps the full command when a Windows interpreter prefix is long", async () => {
+    await create({ mode: "windows-command" });
+    await instance.adapter.sendTurn({ threadId: "t-windows-command", text: "read notes" });
+
+    const command = [
+      "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"",
+      "-Command",
+      `\"Get-Content -Raw -LiteralPath 'C:\\Users\\Ada\\workspaces\\${"very-long-folder\\".repeat(8)}NOTES.md'\"`,
+    ].join(" ");
+    expect(command.length).toBeGreaterThan(200);
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    expect(recorder.events.find((event) => event.type === "item.started")).toMatchObject({
+      type: "item.started",
+      title: command,
+    });
+    expect(opened).toMatchObject({ requestType: "permission", summary: command });
+
+    await instance.adapter.respondToRequest("t-windows-command", opened.requestId!, { behavior: "allow" });
+    await recorder.until((event) => event.type === "turn.completed");
   });
 
   it("uses the instance environment for the Codex process", async () => {
