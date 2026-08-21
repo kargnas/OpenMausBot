@@ -232,7 +232,9 @@ const support = (fetcher: typeof fetch): AcpSupport => ({
   authFailure: "continue",
   isAuthenticated: (env) => Boolean(env.OPENCODE_API_KEY) || hasStoredOpenCodeGoAuth(env),
   classifyError: classifyOpenCodeGoError,
-  resolveModels: async (environment) => mergeLocalInject(await fetchOpenCodeGoModels(fetcher), environment),
+  // catalog (not resolveModels): the remote models API is the primary source,
+  // so the picker must never wait on an ACP probe of the optional CLI.
+  catalog: async (config, environment) => mergeLocalInject(await fetchOpenCodeGoModels(fetcher), environment),
   buildPromptText: (turn) => turn.system ? `${turn.system}\n\n${turn.text}` : turn.text,
 });
 
