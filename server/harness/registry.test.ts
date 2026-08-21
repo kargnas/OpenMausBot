@@ -19,6 +19,36 @@ describe("ProviderRegistry", () => {
     expect(registry.instances()).toHaveLength(1);
   });
 
+  it("reads the live model catalog again on every describe", async () => {
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" } });
+    const live = registry.get("a")!;
+    let model = "fake-1";
+    (live as typeof live & { catalog: () => Promise<unknown> }).catalog = async () => ({
+      default: { model },
+      options: [{ id: model, label: model }],
+    });
+
+    expect((await registry.describe())[0].models.default).toEqual({ model: "fake-1" });
+    model = "fake-2";
+    expect((await registry.describe())[0].models.default).toEqual({ model: "fake-2" });
+  });
+
+  it("reports catalog lookup failures without hiding an available engine", async () => {
+    const fake = makeFakeDriver({ failCatalog: "catalog probe failed" });
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" } });
+
+    const [described] = await registry.describe();
+    expect(described.snapshot.state).toBe("available");
+    expect(described.models).toEqual({
+      default: { model: "" },
+      options: [],
+      error: "catalog probe failed",
+    });
+  });
+
   it("uses defaultConfig when the entry has no config", async () => {
     const fake = makeFakeDriver();
     const registry = new ProviderRegistry([fake.driver]);
@@ -26,6 +56,36 @@ describe("ProviderRegistry", () => {
     // decodeConfig must NOT have been called — defaultConfig() is used verbatim
     expect(fake.decodedConfigs).toHaveLength(0);
     expect(registry.get("a")).not.toBeNull();
+  });
+
+  it("reports cli as overridden only when the raw config sets it", async () => {
+    // Regression: override detection used to read the DECODED config, whose
+    // cli field is always filled in with the driver default — every instance
+    // then showed as "custom" though nothing was touched.
+    const fake = makeFakeDriver();
+    fake.driver.defaultConfig = () => ({ cli: "fakebin" });
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({
+      untouched: { driver: "fake", config: { other: true } },
+      overridden: { driver: "fake", config: { cli: "/opt/fake/custom-bin" } },
+      bare: { driver: "fake" },
+    });
+
+    const described = Object.fromEntries((await registry.describe()).map((d) => [d.instanceId, d]));
+    expect(described.untouched.cli).toBeUndefined();
+    expect(described.bare.cli).toBeUndefined();
+    expect(described.overridden.cli).toBe("/opt/fake/custom-bin");
+    expect(described.untouched.cliDefault).toBe("fakebin");
+    expect(described.untouched.access).toBe("subscription");
+  });
+
+  it("publishes custom-only access from driver metadata", async () => {
+    const fake = makeFakeDriver();
+    Object.assign(fake.driver.metadata, { access: "custom" });
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ local: { driver: "fake" } });
+    const [described] = await registry.describe();
+    expect(described.access).toBe("custom");
   });
 
   it("keeps an unknown driver as an unavailable shadow instead of failing", async () => {
@@ -74,6 +134,8 @@ describe("ProviderRegistry", () => {
     const [described] = await registry.describe();
     expect(described.snapshot).toMatchObject({ state: "unavailable", reason: "provider probe exploded" });
   });
+
+
 
   it("disposeAll disposes every live instance and empties the registry", async () => {
     const fake = makeFakeDriver();

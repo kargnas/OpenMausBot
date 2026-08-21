@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -20,18 +20,24 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const started: Array<{ botId: string; threadId: string; prompt: string }> = [];
   const runOns: string[] = [];
   const triggerSources: string[] = [];
+  const taskActivations: boolean[] = [];
   const emitted: any[] = [];
+  const failed: any[] = [];
   const options: RoutineManagerOptions = {
     file: tempFile(),
     now: () => now,
     emit: (payload) => emitted.push(payload),
     botState: () => bot,
-    createTask: () => ({ threadId: `thread-${++task}` }),
+    createTask: (_botId, _title, activate = false) => {
+      taskActivations.push(activate);
+      return { threadId: `thread-${++task}` };
+    },
     startTurn: async (botId, threadId, prompt, runOn, triggerSource) => {
       started.push({ botId, threadId, prompt });
       runOns.push(runOn);
       triggerSources.push(triggerSource);
     },
+    onRunFailed: (run) => failed.push(run),
   };
   const manager = new RoutineManager(options);
   return {
@@ -41,6 +47,8 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     started,
     runOns,
     triggerSources,
+    taskActivations,
+    failed,
     setNow: (value: number) => (now = value),
     setBot: (value: typeof bot) => (bot = value),
   };
@@ -78,6 +86,13 @@ describe("RoutineManager", () => {
     h.setNow(routine.nextRunAt!);
     await h.manager.tick();
 
+    const routineFile = h.options.file;
+    if (!routineFile) throw new Error("test harness did not configure routine persistence");
+    let failureWasPersistedBeforeCallback = false;
+    h.options.onRunFailed = (run) => {
+      h.failed.push(run);
+      failureWasPersistedBeforeCallback = readFileSync(routineFile, "utf8").includes('"status": "failed"');
+    };
     const reloaded = new RoutineManager(h.options);
     expect(reloaded.listRoutines()).toHaveLength(1);
     expect(reloaded.listRuns()).toMatchObject([
@@ -85,6 +100,16 @@ describe("RoutineManager", () => {
     ]);
     // Reload recovery truthfully marks an in-process run as interrupted.
     expect(reloaded.listRuns()[0]!.error).toContain("restarted");
+    expect(failureWasPersistedBeforeCallback).toBe(true);
+    expect(h.failed).toMatchObject([
+      {
+        routineId: routine.id,
+        routineName: "Morning brief",
+        status: "failed",
+        threadId: "thread-1",
+        error: "OpenMausBot restarted while this routine was running",
+      },
+    ]);
   });
 
   it("queues behind a busy bot, then dispatches into a detached task", async () => {
@@ -108,6 +133,7 @@ describe("RoutineManager", () => {
     expect(h.manager.listRuns()[0]).toMatchObject({ status: "running", threadId: "thread-1" });
     expect(h.manager.activeRunForBot("maus-2")?.threadId).toBe("thread-1");
     expect(h.manager.isActiveThread("thread-1")).toBe(true);
+    expect(h.taskActivations).toEqual([false]);
   });
 
   it("cancels queued work when a routine is paused", async () => {
@@ -175,7 +201,7 @@ describe("RoutineManager", () => {
     expect(h.manager.listRoutines()[0]).toMatchObject({ runOn: "maus" });
   });
 
-  it("queues webhook jobs through the same detached-task executor", async () => {
+  it("opens webhook jobs in the assigned bot's live chat", async () => {
     const h = harness();
     const receivedAt = new Date(2026, 7, 17, 8, 2).getTime();
     const queued = h.manager.enqueueWebhook({
@@ -200,6 +226,7 @@ describe("RoutineManager", () => {
     expect(h.started).toEqual([{ botId: "maus-webhook", threadId: "thread-1", prompt: "Handle ticket 42" }]);
     expect(h.runOns).toEqual(["cloud"]);
     expect(h.triggerSources).toEqual(["webhook"]);
+    expect(h.taskActivations).toEqual([true]);
   });
 
   it("folds provider lifecycle events into the calendar receipt", async () => {
@@ -229,6 +256,42 @@ describe("RoutineManager", () => {
       output: "Report shipped.",
       cost: 0.02,
     });
+  });
+
+  it("reports a failed run once with its detached thread", async () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Broken report",
+      prompt: "Write the report",
+      botId: "maus-failed",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 1).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+
+    h.manager.handleRuntimeEvent({
+      eventId: "failed",
+      provider: "fake",
+      threadId: "thread-1",
+      createdAt: new Date().toISOString(),
+      type: "turn.completed",
+      ok: false,
+      stopReason: "provider crashed",
+    });
+
+    expect(h.failed).toMatchObject([
+      {
+        routineName: "Broken report",
+        botId: "maus-failed",
+        threadId: "thread-1",
+        status: "failed",
+        error: "provider crashed",
+      },
+    ]);
+    expect(h.manager.listRuns()[0]).toMatchObject({ threadId: "thread-1", status: "failed" });
+
+    h.manager.markSeen(h.failed[0].id);
+    expect(h.failed).toHaveLength(1);
   });
 
   it("keeps recurring history while advancing the definition", async () => {

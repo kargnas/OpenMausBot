@@ -115,6 +115,59 @@ test("a manual request during a background check preserves user-visible errors",
   assert.deepEqual(getState(), { status: "error", message: "background request failed" });
 });
 
+test("download reports downloading before the first progress event", async () => {
+  const { updater, coordinator, getState, states } = harness();
+  const pending = deferred();
+  // a real transfer stays silent until bytes arrive; the button must not wait
+  updater.downloadUpdate = () => pending.promise;
+
+  const download = coordinator.download();
+  assert.deepEqual(getState(), { status: "downloading" });
+  assert.equal(states[0].status, "downloading");
+
+  updater.emit("download-progress", { percent: 12 });
+  assert.deepEqual(getState(), { status: "downloading", percent: 12 });
+
+  pending.resolve();
+  await download;
+});
+
+test("downloaded waits for native staging to finish before becoming actionable", async () => {
+  const { updater, coordinator, getState } = harness();
+  const pending = deferred();
+  updater.downloadUpdate = () => pending.promise;
+
+  const download = coordinator.download();
+  updater.emit("update-downloaded", { version: "2.0.0" });
+  assert.deepEqual(getState(), { status: "downloading" });
+
+  pending.resolve(["update.zip"]);
+  await download;
+  assert.deepEqual(getState(), { status: "downloaded", version: "2.0.0" });
+});
+
+test("an asynchronous native install error escapes the restarting spinner", () => {
+  const { updater, coordinator, getState, states } = harness();
+  const error = new Error("native staging failed");
+  updater.quitAndInstall = () => updater.emit("error", error);
+
+  coordinator.install();
+
+  assert.deepEqual(getState(), { status: "error", message: "native staging failed" });
+  assert.equal(errorStates(states).length, 1);
+});
+
+test("a synchronous install failure becomes a user-visible error", () => {
+  const { updater, coordinator, getState } = harness();
+  updater.quitAndInstall = () => {
+    throw new Error("install threw");
+  };
+
+  coordinator.install();
+
+  assert.deepEqual(getState(), { status: "error", message: "install threw" });
+});
+
 test("an active download state survives a later background check failure", async () => {
   const { updater, coordinator, getState } = harness();
   const downloadPending = deferred();

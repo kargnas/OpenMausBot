@@ -4,7 +4,8 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly;
 // spawnCli resolves it to `node <script>`, so these run everywhere.
-import { chmodSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -63,6 +64,7 @@ describe("Antigravity turns (fake CLI)", () => {
   });
 
   afterEach(async () => {
+    delete process.env.FAKE_AGY_DUMP;
     recorder?.stop();
     await instance?.dispose();
   });
@@ -99,15 +101,51 @@ describe("Antigravity turns (fake CLI)", () => {
     expect((text as any).text).toBe("done from fake agy");
 
     const done = recorder.events.at(-1)!;
-    expect(done).toMatchObject({ type: "turn.completed", ok: true });
+    // result.usage is the turn total (the per-step figures precede it)
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 105, output: 20 } });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
   });
 
-  it("rejects respondToRequest — no interactive permission channel", async () => {
+  it("discovers models and configured defaults from the CLI JSON catalog", async () => {
     await create();
-    await expect(
-      instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" }),
-    ).rejects.toThrow(/no interactive permission channel/);
+
+    await expect(instance.catalog()).resolves.toEqual({
+      default: { model: "fake-agy-pro", effort: "high" },
+      options: [
+        {
+          id: "fake-agy-pro",
+          label: "Fake Agy Pro",
+          efforts: ["low", "high"],
+          defaultEffort: "low",
+        },
+        { id: "fake-agy-flash", label: "Fake Agy Flash" },
+      ],
+    });
+  });
+
+  it("passes the selected model and effort to Antigravity", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-selection-"));
+    const dump = join(scratch, "argv.json");
+    process.env.FAKE_AGY_DUMP = dump;
+    await create();
+
+    await instance.adapter.sendTurn({
+      threadId: "t-selection",
+      text: "go",
+      model: "fake-agy-pro",
+      effort: "high",
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const { argv } = JSON.parse(readFileSync(dump, "utf8"));
+    expect(argv.slice(argv.indexOf("--model"), argv.indexOf("--model") + 2)).toEqual(["--model", "fake-agy-pro"]);
+    expect(argv.slice(argv.indexOf("--effort"), argv.indexOf("--effort") + 2)).toEqual(["--effort", "high"]);
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
+    await create();
+    await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
   });
 });
 
@@ -141,5 +179,36 @@ describe("Antigravity snapshot", () => {
     const snap = await instance.snapshot();
     expect(snap.state).toBe("unavailable");
     await instance.dispose();
+  });
+
+  it("strips workspace credentials from snapshot and helper children", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-env-"));
+    const dump = join(scratch, "dump.json");
+    const names = ["XAI_API_KEY", "COMPOSIO_API_KEY", "BOX_TOKEN", "OPENCODE_API_KEY", "OMB_TTS_KEY"] as const;
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    process.env.FAKE_AGY_DUMP = dump;
+    for (const name of names) process.env[name] = `${name}-must-not-leak`;
+    const instance = await AntigravityDriver.create({
+      instanceId: "agy-env",
+      displayName: undefined,
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      await instance.snapshot();
+      for (const name of names) expect(JSON.parse(readFileSync(dump, "utf8")).env[name]).toBeUndefined();
+
+      await instance.generateText?.("summarize safely");
+      for (const name of names) expect(JSON.parse(readFileSync(dump, "utf8")).env[name]).toBeUndefined();
+    } finally {
+      await instance.dispose();
+      delete process.env.FAKE_AGY_DUMP;
+      for (const name of names) {
+        if (previous[name] === undefined) delete process.env[name];
+        else process.env[name] = previous[name];
+      }
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });

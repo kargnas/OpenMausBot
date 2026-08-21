@@ -5,7 +5,7 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | exit-early | hang | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | crash-on-prompt | fail-after-text | hang | no-auth | auth-required | permission
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
 //                   | ask-peer (spawn the injected "agents" MCP server from
@@ -13,6 +13,11 @@
 //                     peer, and reply with what the peer said — the comms e2e)
 //                   | delegate-peer (same as ask-peer but uses delegate_bot —
 //                     returns immediately, the peer runs after our turn)
+//                   | echo-gated (reply by echoing the full prompt, and when
+//                     FAKE_ACP_GATE_FILE is set hold the turn open until that
+//                     file exists — a deterministic busy window for the
+//                     steer-queue e2e, with the echo pinning exactly what a
+//                     drained turn was sent)
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -27,7 +32,7 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 // opencode-shaped surface: the session carries its own model catalog and the
@@ -50,26 +55,103 @@ const configOptions = () =>
       ]
     : null;
 const argv = process.argv.slice(2);
+const dumpEnv = Object.fromEntries(
+  [
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "SystemRoot",
+    "FAKE_ACP_MODE",
+    "FAKE_ACP_RPC_DUMP",
+    "TEST_POLICY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "XAI_API_KEY",
+    "BOX_TOKEN",
+    "OMB_TTS_KEY",
+    "FACTORY_API_KEY",
+    "UNSLOTH_STUDIO_AUTH_TOKEN",
+    "CURSOR_API_KEY",
+    "CURSOR_AUTH_TOKEN",
+    "KIMI_MODEL_NAME",
+    "KIMI_MODEL_API_KEY",
+    "KIMI_MODEL_BASE_URL",
+    "KIMI_MODEL_PROVIDER_TYPE",
+    "KIMI_MODEL_DISPLAY_NAME",
+    "TEST_TURN_MODEL",
+  ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
+);
+const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
 if (process.env.FAKE_ACP_DUMP) {
-  const dumpEnv = Object.fromEntries(
-    [
-      "PATH",
-      "HOME",
-      "USERPROFILE",
-      "SystemRoot",
-      "FAKE_ACP_MODE",
-      "FAKE_ACP_RPC_DUMP",
-      "TEST_POLICY",
-      "OPENCODE_API_KEY",
-      "OPENAI_API_KEY",
-      "ANTHROPIC_API_KEY",
-      "XAI_API_KEY",
-    ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
-  );
-  writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify({ argv, env: dumpEnv }, null, 2));
+  writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
+}
+// RPC calls seen this run — the dump tests assert on them.
+const calls: Array<{ method: string; params: unknown }> = [];
+dumpState.calls = calls;
+const dump = () => {
+  if (process.env.FAKE_ACP_DUMP) writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
+};
+dump();
+// droid's catalog source: `droid exec --help` prints the model table
+if (argv.join(" ") === "exec --help") {
+  if (process.env.FAKE_ACP_HELP_DUMP) writeFileSync(process.env.FAKE_ACP_HELP_DUMP, "called");
+  console.log(`Available Models:
+  auto                         Auto Model
+  claude-opus-5                Opus 5 (default)
+  claude-sonnet-5              Sonnet 5
+
+Model details:
+  - Auto Model: supports reasoning: No; supported: [none]; default: none
+  - Opus 5: supports reasoning: Yes; supported: [low, high, max]; default: high
+  - Sonnet 5: supports reasoning: Yes; supported: [low, medium, high]; default: high`);
+  process.exit(0);
 }
 if (argv.includes("--version")) {
   console.log("fake-acp 1.0.0");
+  process.exit(0);
+}
+// Cursor's driver probes `agent status` / `agent models` on the same binary
+// it later spawns for ACP. Answer those without entering the JSON-RPC loop
+// so catalog/auth tests do not hang on stdin.
+if (argv[0] === "status" || argv[0] === "whoami") {
+  const authenticated = process.env.FAKE_ACP_AUTH !== "0";
+  console.log(JSON.stringify({ isAuthenticated: authenticated }));
+  process.exit(0);
+}
+if (argv[0] === "models" || argv.includes("--list-models")) {
+  console.log(
+    [
+      "Available models",
+      "",
+      "auto - Auto (default)",
+      "composer-2.5 - Composer 2.5 (current)",
+      "gpt-5.3-codex - Codex 5.3",
+      "cursor-live - Cursor Live",
+    ].join("\n"),
+  );
+  process.exit(0);
+}
+
+if (argv.join(" ") === "provider list --json") {
+  console.log(
+    JSON.stringify({
+      providers: {},
+      models: {
+        "fake-kimi-1": {
+          displayName: "Fake Kimi One",
+          capabilities: ["thinking", "tool_use"],
+          supportEfforts: ["low", "high"],
+          defaultEffort: "low",
+        },
+        "fake-kimi-2": {
+          displayName: "Fake Kimi Two",
+          capabilities: [],
+        },
+      },
+    }),
+  );
   process.exit(0);
 }
 
@@ -94,9 +176,9 @@ let agentsMcp: McpEntry | null = null;
 
 /** Minimal one-shot MCP stdio client: initialize, call each tool in
  * sequence, return the text of the last result. Dependency-free. */
-function driveMcp(entry: McpEntry, calls: Array<{ name: string; args: (prev: string) => unknown }>): Promise<string> {
+function driveMcp(entry: McpEntry, calls: Array<{ name: string; args: (prev: string) => object }>): Promise<string> {
   return new Promise((resolve, reject) => {
-    const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+    const env = { ...process.env };
     for (const { name, value } of entry.env ?? []) env[name] = value;
     const child = spawn(entry.command, entry.args ?? [], { env, stdio: ["pipe", "pipe", "inherit"] });
     child.on("error", reject);
@@ -175,6 +257,8 @@ function handle(msg: any) {
   }
   if (!msg.method) return;
   recordMethod(msg.method);
+  calls.push({ method: msg.method, params: msg.params ?? null });
+  dump();
 
   switch (msg.method) {
     case "initialize": {
@@ -183,7 +267,29 @@ function handle(msg: any) {
         process.exit(3);
       }
       const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
-      result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      result(msg.id, {
+        protocolVersion: 1,
+        authMethods,
+        _meta: {
+          modelState: {
+            currentModelId: "fake-acp-model",
+            availableModels: [
+              {
+                modelId: "fake-acp-model",
+                name: "Fake ACP Model",
+                _meta: {
+                  reasoningEffort: "high",
+                  reasoningEfforts: [
+                    { id: "low", value: "low" },
+                    { id: "high", value: "high" },
+                  ],
+                },
+              },
+              { modelId: "fake-acp-fast", name: "Fake ACP Fast" },
+            ],
+          },
+        },
+      });
       break;
     }
     case "authenticate":
@@ -199,7 +305,14 @@ function handle(msg: any) {
         break;
       }
       const servers: McpEntry[] = Array.isArray(msg.params?.mcpServers) ? msg.params.mcpServers : [];
+      if (process.env.FAKE_ACP_DUMP) {
+        dumpState.mcpServers = servers;
+        writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
+      }
       agentsMcp = servers.find((s: any) => s?.name === "agents") ?? null;
+      if (process.env.FAKE_ACP_DUMP) {
+        writeFileSync(`${process.env.FAKE_ACP_DUMP}.mcp.json`, JSON.stringify(servers, null, 2));
+      }
       const opts = configOptions();
       result(msg.id, opts ? { sessionId: "fake-acp-session", configOptions: opts } : { sessionId: "fake-acp-session" });
       break;
@@ -237,6 +350,18 @@ function handle(msg: any) {
     }
     case "session/set_config_option": {
       const { configId, value } = msg.params ?? {};
+      if (configId === "reasoning_effort" && typeof value === "string") {
+        configCalls.push({ method: msg.method, params: msg.params });
+        if (process.env.FAKE_ACP_DUMP) {
+          writeFileSync(`${process.env.FAKE_ACP_DUMP}.config.json`, JSON.stringify(configCalls, null, 2));
+        }
+        result(msg.id, { configOptions: [] });
+        break;
+      }
+      if (configId === "thinking" && typeof value === "string") {
+        result(msg.id, { configOptions: [] });
+        break;
+      }
       if (configId !== "model" || !models.includes(value)) {
         out({
           jsonrpc: "2.0",
@@ -253,9 +378,25 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      if (mode === "crash-on-prompt") {
+        // initialize answered fine (the catalog probe passes); the crash
+        // lands mid-turn, after the harness already started the session
+        process.stderr.write("fake-acp: simulated crash mid-turn\n");
+        process.exit(3);
+      }
       if (mode === "hang") {
         // never resolve the prompt — lets tests exercise interrupt
         setInterval(() => {}, 1_000);
+        return;
+      }
+      if (mode === "fail-after-text") {
+        // Stream real text, THEN fail the turn — the shape of a crash
+        // mid-answer. This is the one case where the routine-failed/done
+        // notification dedup is load-bearing: the reply is non-empty, so
+        // nothing else suppresses the generic done.
+        out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "half a report, then a crash" } } } });
+        recordMethod("session/prompt.error");
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "fake acp: turn failed after streaming" } });
         return;
       }
       const complete = () => {
@@ -290,6 +431,27 @@ function handle(msg: any) {
           });
         return;
       }
+      if (mode === "echo-gated") {
+        // echoing the WHOLE prompt (system + turn text) lets a test assert
+        // both what a drained turn was sent and what it was NOT sent (e.g.
+        // the webhook untrusted-data paragraph a steered turn must not get)
+        const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+        const finish = () => {
+          out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `echo: ${promptText}` } } } });
+          complete();
+        };
+        const gate = process.env.FAKE_ACP_GATE_FILE;
+        if (gate && !existsSync(gate)) {
+          const poll = setInterval(() => {
+            if (!existsSync(gate)) return;
+            clearInterval(poll);
+            finish();
+          }, 50);
+          return;
+        }
+        finish();
+        return;
+      }
       if (mode === "delegate-peer" && agentsMcp) {
         // async peer-handoff e2e: queue the delegation and return
         // immediately; the harness fires the peer's depth-1 turn after our
@@ -316,7 +478,7 @@ function handle(msg: any) {
           });
         return;
       }
-      playTurn();
+      if (mode !== "empty-reply") playTurn();
       if (mode === "permission") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;
